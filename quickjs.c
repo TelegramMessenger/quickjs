@@ -81,7 +81,7 @@
 #define __extension__
 #endif
 
-#ifndef NDEBUG
+#if !defined(NDEBUG) && !defined(QJS_DISABLE_DUMPS)
 #define ENABLE_DUMPS
 #endif
 
