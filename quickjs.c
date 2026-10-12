@@ -14700,6 +14700,68 @@ static JSValue JS_ToStringCheckObject(JSContext *ctx, JSValueConst val)
     return JS_ToString(ctx, val);
 }
 
+/* append JSON.stringify's quoted form of p to b */
+static int string_buffer_put_quoted(StringBuffer *b, JSString *p)
+{
+    int i, j;
+    uint32_t c;
+    char buf[16];
+
+    if (string_buffer_putc8(b, '\"'))
+        return -1;
+    for(i = 0; i < p->len; ) {
+        if (!p->is_wide_char) {
+            /* copy runs of characters that need no escaping in one go */
+            const uint8_t *s8 = str8(p);
+            for (j = i; j < p->len && s8[j] >= 32 && s8[j] != '\"' && s8[j] != '\\'; j++)
+                continue;
+            if (j > i) {
+                if (string_buffer_write8(b, s8 + i, j - i))
+                    return -1;
+                i = j;
+                continue;
+            }
+        }
+        c = string_getc(p, &i);
+        switch(c) {
+        case '\t':
+            c = 't';
+            goto quote;
+        case '\r':
+            c = 'r';
+            goto quote;
+        case '\n':
+            c = 'n';
+            goto quote;
+        case '\b':
+            c = 'b';
+            goto quote;
+        case '\f':
+            c = 'f';
+            goto quote;
+        case '\"':
+        case '\\':
+        quote:
+            if (string_buffer_putc8(b, '\\'))
+                return -1;
+            if (string_buffer_putc8(b, c))
+                return -1;
+            break;
+        default:
+            if (c < 32 || is_surrogate(c)) {
+                snprintf(buf, sizeof(buf), "\\u%04x", c);
+                if (string_buffer_write8(b, (uint8_t*)buf, 6))
+                    return -1;
+            } else {
+                if (string_buffer_putc(b, c))
+                    return -1;
+            }
+            break;
+        }
+    }
+    return string_buffer_putc8(b, '\"');
+}
+
 static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
 {
     JSValue val;
@@ -51620,11 +51682,13 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                 v = JS_GetPropertyInt64(ctx, val, i);
                 if (JS_IsException(v))
                     goto exception;
-                /* XXX: could do this string conversion only when needed */
-                prop = JS_ToStringFree(ctx, js_int64(i));
-                if (JS_IsException(prop)) {
-                    JS_FreeValue(ctx, v);
-                    goto exception;
+                if (JS_IsObject(v) || JS_IsBigInt(v) ||
+                    !JS_IsUndefined(jsc->replacer_func)) {
+                    prop = JS_ToStringFree(ctx, js_int64(i));
+                    if (JS_IsException(prop)) {
+                        JS_FreeValue(ctx, v);
+                        goto exception;
+                    }
                 }
                 v = js_json_check(ctx, jsc, val, v, prop);
                 JS_FreeValue(ctx, prop);
@@ -51667,13 +51731,21 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                 if (!JS_IsUndefined(v)) {
                     if (has_content)
                         string_buffer_putc8(jsc->b, ',');
-                    prop = JS_ToQuotedStringFree(ctx, prop);
-                    if (JS_IsException(prop)) {
-                        JS_FreeValue(ctx, v);
-                        goto exception;
+                    if (JS_VALUE_GET_TAG(prop) == JS_TAG_STRING) {
+                        string_buffer_concat_value(jsc->b, sep);
+                        if (string_buffer_put_quoted(jsc->b, JS_VALUE_GET_STRING(prop))) {
+                            JS_FreeValue(ctx, v);
+                            goto exception;
+                        }
+                    } else {
+                        prop = JS_ToQuotedStringFree(ctx, prop);
+                        if (JS_IsException(prop)) {
+                            JS_FreeValue(ctx, v);
+                            goto exception;
+                        }
+                        string_buffer_concat_value(jsc->b, sep);
+                        string_buffer_concat_value(jsc->b, prop);
                     }
-                    string_buffer_concat_value(jsc->b, sep);
-                    string_buffer_concat_value(jsc->b, prop);
                     string_buffer_putc8(jsc->b, ':');
                     string_buffer_concat_value(jsc->b, sep1);
                     if (js_json_to_str(ctx, jsc, val, v, indent1))
@@ -51700,6 +51772,9 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
  concat_primitive:
     switch (JS_VALUE_GET_NORM_TAG(val)) {
     case JS_TAG_STRING:
+        ret = string_buffer_put_quoted(jsc->b, JS_VALUE_GET_STRING(val));
+        JS_FreeValue(ctx, val);
+        return ret;
     case JS_TAG_STRING_ROPE:
         val = JS_ToQuotedStringFree(ctx, val);
         if (JS_IsException(val))
@@ -51708,9 +51783,22 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
     case JS_TAG_FLOAT64:
         if (!isfinite(JS_VALUE_GET_FLOAT64(val))) {
             val = JS_NULL;
+            goto concat_value;
+        } else {
+            char nbuf[128];
+            JSDTOATempMem dtoa_mem;
+            double d = JS_VALUE_GET_FLOAT64(val);
+            if (js_dtoa_max_len(d, 10, 0, JS_DTOA_FORMAT_FREE) > (int)sizeof(nbuf) - 1)
+                goto concat_value;
+            return string_buffer_write8(jsc->b, (uint8_t *)nbuf,
+                                        js_dtoa(nbuf, d, 10, 0, JS_DTOA_FORMAT_FREE, &dtoa_mem));
         }
-        goto concat_value;
     case JS_TAG_INT:
+        {
+            char nbuf[16];
+            return string_buffer_write8(jsc->b, (uint8_t *)nbuf,
+                                        i32toa(nbuf, JS_VALUE_GET_INT(val)));
+        }
     case JS_TAG_BOOL:
     case JS_TAG_NULL:
     concat_value:
