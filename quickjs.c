@@ -554,6 +554,7 @@ enum {
 /* must be large enough to have a negligible runtime cost and small
    enough to call the interrupt callback often. */
 #define JS_INTERRUPT_COUNTER_INIT 10000
+#define JS_REGEXP_CACHE_SIZE 16
 
 struct JSContext {
     JSGCObjectHeader header; /* must come first */
@@ -612,6 +613,13 @@ struct JSContext {
     /* if NULL, RegExp compilation is not supported */
     JSValue (*compile_regexp)(JSContext *ctx, JSValueConst pattern,
                               JSValueConst flags);
+    /* recently compiled RegExp bytecode, keyed by pattern and flags
+       (the bytecode is immutable and already shared between objects) */
+    struct {
+        JSString *pattern;
+        JSString *bytecode;
+        int flags;
+    } regexp_cache[JS_REGEXP_CACHE_SIZE];
     /* if NULL, eval is not supported */
     JSValue (*eval_internal)(JSContext *ctx, JSValueConst this_obj,
                              const char *input, size_t input_len,
@@ -3098,6 +3106,13 @@ void JS_FreeContext(JSContext *ctx)
     JS_FreeValue(ctx, ctx->regexp_ctor);
     JS_FreeValue(ctx, ctx->function_ctor);
     JS_FreeValue(ctx, ctx->function_proto);
+
+    for(i = 0; i < JS_REGEXP_CACHE_SIZE; i++) {
+        if (ctx->regexp_cache[i].pattern) {
+            JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, ctx->regexp_cache[i].pattern));
+            JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, ctx->regexp_cache[i].bytecode));
+        }
+    }
 
     js_free_shape_null(ctx->rt, ctx->array_shape);
     js_free_shape_null(ctx->rt, ctx->arguments_shape);
@@ -49263,7 +49278,7 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
     int re_flags, mask;
     uint8_t *re_bytecode_buf;
     size_t i, len;
-    int re_bytecode_len;
+    int re_bytecode_len, cache_slot;
     JSValue ret;
     char error_msg[64];
 
@@ -49316,6 +49331,16 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
         if (re_flags & LRE_FLAG_UNICODE_SETS)
             return JS_ThrowSyntaxError(ctx, "invalid regular expression flags");
 
+    cache_slot = -1;
+    if (JS_VALUE_GET_TAG(pattern) == JS_TAG_STRING) {
+        JSString *ps = JS_VALUE_GET_STRING(pattern);
+        cache_slot = (hash_string(ps, re_flags) * 0x9e3779b1u) >> (32 - 4);
+        if (ctx->regexp_cache[cache_slot].pattern &&
+            ctx->regexp_cache[cache_slot].flags == re_flags &&
+            js_string_eq(ctx->regexp_cache[cache_slot].pattern, ps))
+            return js_dup(JS_MKPTR(JS_TAG_STRING, ctx->regexp_cache[cache_slot].bytecode));
+    }
+
     /* The v flag implies full Unicode, like u, so the pattern must be
        UTF-8 (not CESU-8) for both. */
     str = JS_ToCStringLen2(ctx, &len, pattern,
@@ -49338,6 +49363,15 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
         JSString *p = JS_VALUE_GET_STRING(ret);
         p->kind = JS_STRING_KIND_INDIRECT;
         p->len = re_bytecode_len;
+        if (cache_slot >= 0) {
+            if (ctx->regexp_cache[cache_slot].pattern) {
+                JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, ctx->regexp_cache[cache_slot].pattern));
+                JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, ctx->regexp_cache[cache_slot].bytecode));
+            }
+            ctx->regexp_cache[cache_slot].pattern = JS_VALUE_GET_STRING(js_dup(pattern));
+            ctx->regexp_cache[cache_slot].bytecode = JS_VALUE_GET_STRING(js_dup(ret));
+            ctx->regexp_cache[cache_slot].flags = re_flags;
+        }
     }
     return ret;
 }
