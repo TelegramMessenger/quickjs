@@ -18332,6 +18332,62 @@ static bool needs_backtrace(JSValue exc)
     return can_store_error_stack(exc) || can_add_backtrace(exc);
 }
 
+/* Store a number into a typed array element without conversion side
+   effects: int values into the integer arrays (except BigInt) and any
+   number into the float32/float64 arrays. Return false to take the
+   generic path. 'idx' is in bounds. */
+static inline bool js_put_fast_typed_array_element(JSObject *p, uint32_t idx,
+                                                   JSValueConst val)
+{
+    uint32_t tag = JS_VALUE_GET_TAG(val);
+    int32_t v;
+
+    if (typed_array_is_immutable(p))
+        return false;
+    switch(p->class_id) {
+    case JS_CLASS_FLOAT64_ARRAY:
+        if (JS_TAG_IS_FLOAT64(tag))
+            p->u.array.u.double_ptr[idx] = JS_VALUE_GET_FLOAT64(val);
+        else if (tag == JS_TAG_INT)
+            p->u.array.u.double_ptr[idx] = JS_VALUE_GET_INT(val);
+        else
+            return false;
+        return true;
+    case JS_CLASS_FLOAT32_ARRAY:
+        if (JS_TAG_IS_FLOAT64(tag))
+            p->u.array.u.float_ptr[idx] = JS_VALUE_GET_FLOAT64(val);
+        else if (tag == JS_TAG_INT)
+            p->u.array.u.float_ptr[idx] = JS_VALUE_GET_INT(val);
+        else
+            return false;
+        return true;
+    default:
+        break;
+    }
+    if (tag != JS_TAG_INT)
+        return false;
+    v = JS_VALUE_GET_INT(val);
+    switch(p->class_id) {
+    case JS_CLASS_UINT8C_ARRAY:
+        p->u.array.u.uint8_ptr[idx] = v < 0 ? 0 : v > 255 ? 255 : v;
+        return true;
+    case JS_CLASS_INT8_ARRAY:
+    case JS_CLASS_UINT8_ARRAY:
+        p->u.array.u.uint8_ptr[idx] = v;
+        return true;
+    case JS_CLASS_INT16_ARRAY:
+    case JS_CLASS_UINT16_ARRAY:
+        p->u.array.u.uint16_ptr[idx] = v;
+        return true;
+    case JS_CLASS_INT32_ARRAY:
+    case JS_CLASS_UINT32_ARRAY:
+        p->u.array.u.uint32_ptr[idx] = v;
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
@@ -20297,6 +20353,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 }
                             }
                         }
+                        if (p->class_id >= JS_CLASS_UINT8C_ARRAY &&
+                            p->class_id <= JS_CLASS_FLOAT64_ARRAY &&
+                            idx < (uint32_t)p->u.array.count &&
+                            js_put_fast_typed_array_element(p, idx, val)) {
+                            JS_FreeValue(ctx, sp[-3]);
+                            sp -= 3;
+                            BREAK;
+                        }
                     }
                 }
                 sf->cur_pc = pc;
@@ -20918,14 +20982,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
 
-#define OP_CMP(opcode, binary_op, slow_call)              \
+#define OP_CMP(opcode, binary_op, slow_call, num)         \
             CASE(opcode):                                 \
                 {                                         \
                 JSValue op1, op2;                         \
+                double d1, d2;                                          \
                 op1 = sp[-2];                             \
                 op2 = sp[-1];                                   \
                 if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
                     sp[-2] = js_bool(JS_VALUE_GET_INT(op1) binary_op JS_VALUE_GET_INT(op2)); \
+                    sp--;                                               \
+                } else if (num && js_arith_to_float64(op1, &d1) &&      \
+                           js_arith_to_float64(op2, &d2)) {             \
+                    sp[-2] = js_bool(d1 binary_op d2);                  \
                     sp--;                                               \
                 } else {                                                \
                     sf->cur_pc = pc;                                    \
@@ -20936,14 +21005,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }                                                       \
             BREAK
 
-            OP_CMP(OP_lt, <, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_lte, <=, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_gt, >, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_gte, >=, js_relational_slow(ctx, sp, opcode));
-            OP_CMP(OP_eq, ==, js_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_neq, !=, js_eq_slow(ctx, sp, 1));
-            OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
+            OP_CMP(OP_lt, <, js_relational_slow(ctx, sp, opcode), 1);
+            OP_CMP(OP_lte, <=, js_relational_slow(ctx, sp, opcode), 1);
+            OP_CMP(OP_gt, >, js_relational_slow(ctx, sp, opcode), 1);
+            OP_CMP(OP_gte, >=, js_relational_slow(ctx, sp, opcode), 1);
+            OP_CMP(OP_eq, ==, js_eq_slow(ctx, sp, 0), 0);
+            OP_CMP(OP_neq, !=, js_eq_slow(ctx, sp, 1), 0);
+            OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0), 0);
+            OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1), 0);
 
         CASE(OP_in):
             sf->cur_pc = pc;
