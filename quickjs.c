@@ -279,6 +279,30 @@ typedef struct JSMallocState {
 #define JS_ARENA_LARGE_BLOCKS_ONLY 0
 #endif
 
+#if !JS_ARENA_LARGE_BLOCKS_ONLY && (defined(__APPLE__) || defined(__linux__))
+#include <sys/mman.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/vm_statistics.h>
+#define JS_ARENA_SLAB_TAG          VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1)
+#define JS_ARENA_PAGE_RELEASE      MADV_FREE_REUSABLE
+#else
+#define JS_ARENA_SLAB_TAG          (-1)
+#define JS_ARENA_PAGE_RELEASE      MADV_DONTNEED
+#endif
+#define JS_ARENA_SLABS             1
+#define JS_ARENA_SLAB_SLOTS        16
+#define JS_ARENA_SLAB_FULL         0xffff
+#define JS_ARENA_SLAB_BYTES        (JS_ARENA_SLAB_SLOTS * JS_ARENA_SIZE)
+
+typedef struct JSArenaSlab {
+    struct list_head link;
+    uint8_t *base;
+    uint16_t used;
+    uint16_t released;
+} JSArenaSlab;
+#endif
+
 /* 8-byte header preceding every user allocation. It carries the allocator
    bookkeeping (block_idx/free_next + block_size_idx) and, the
    GC/refcount fields (gc_obj_type/mark/ref_count) that would otherwise sit in
@@ -300,6 +324,9 @@ typedef struct JSMallocBlockHeader {
 typedef struct JSArena {
     struct list_head free_link;   /* in free_arena_list[idx] while not full */
     struct list_head link;        /* in arena_list[idx] for the whole lifetime */
+#ifdef JS_ARENA_SLABS
+    JSArenaSlab *slab;
+#endif
     uint8_t  block_size_idx;
     uint16_t n_used_blocks;
     uint16_t n_blocks;
@@ -310,6 +337,10 @@ typedef struct JSArena {
 typedef struct JSArenaState {
     struct list_head arena_list[JS_ARENA_BLOCK_SIZE_COUNT];
     struct list_head free_arena_list[JS_ARENA_BLOCK_SIZE_COUNT];
+#ifdef JS_ARENA_SLABS
+    struct list_head slab_list;
+    JSArenaSlab *spare_slab;
+#endif
     _Alignas(JS_ARENA_ALIGN) uint8_t zero_size_block[sizeof(JSMallocBlockHeader)];
 } JSArenaState;
 
@@ -1745,7 +1776,159 @@ static void js_arena_init(JSRuntime *rt)
         init_list_head(&s->arena_list[i]);
         init_list_head(&s->free_arena_list[i]);
     }
+#ifdef JS_ARENA_SLABS
+    init_list_head(&s->slab_list);
+    s->spare_slab = NULL;
+#endif
 }
+
+#ifdef JS_ARENA_SLABS
+static size_t arena_page_size(void)
+{
+    static size_t page_size;
+    if (!page_size) {
+        long v = sysconf(_SC_PAGESIZE);
+        page_size = v > 0 ? (size_t)v : 4096;
+    }
+    return page_size;
+}
+
+static int arena_slots_per_page(void)
+{
+    size_t page = arena_page_size();
+    if (page < JS_ARENA_SIZE || page > JS_ARENA_SLAB_BYTES || page % JS_ARENA_SIZE || JS_ARENA_SLAB_BYTES % page)
+        return 0;
+    return (int)(page / JS_ARENA_SIZE);
+}
+
+static void arena_slab_release_pages(JSArenaSlab *slab, uint16_t pages)
+{
+    int per_page = arena_slots_per_page();
+    int i, n_pages;
+    if (!per_page)
+        return;
+    n_pages = JS_ARENA_SLAB_SLOTS / per_page;
+    for (i = 0; i < n_pages; i++) {
+        if ((pages & (1u << i)) && !(slab->released & (1u << i))) {
+            madvise(slab->base + (size_t)i * per_page * JS_ARENA_SIZE, (size_t)per_page * JS_ARENA_SIZE, JS_ARENA_PAGE_RELEASE);
+            slab->released |= (uint16_t)(1u << i);
+        }
+    }
+}
+
+static void arena_slab_destroy(JSRuntime *rt, JSArenaSlab *slab)
+{
+    munmap(slab->base, JS_ARENA_SLAB_BYTES);
+    rt->mf.js_free(rt->malloc_state.opaque, slab);
+}
+
+static uint16_t arena_slab_released_slots(const JSArenaSlab *slab, int per_page)
+{
+    uint16_t slots = 0;
+    int page;
+    if (!per_page || !slab->released)
+        return 0;
+    for (page = 0; page < JS_ARENA_SLAB_SLOTS / per_page; page++) {
+        if (slab->released & (1u << page))
+            slots |= (uint16_t)(((1u << per_page) - 1) << (page * per_page));
+    }
+    return slots;
+}
+
+static JSArena *arena_slab_take(JSRuntime *rt)
+{
+    JSArenaState *s = &rt->arena_state;
+    JSArenaSlab *slab = NULL, *fallback = NULL;
+    struct list_head *el;
+    int slot = -1, per_page = arena_slots_per_page(), page;
+    list_for_each(el, &s->slab_list) {
+        JSArenaSlab *candidate = list_entry(el, JSArenaSlab, link);
+        uint16_t free_slots = (uint16_t)(~candidate->used & JS_ARENA_SLAB_FULL);
+        uint16_t dirty_free;
+        if (!free_slots)
+            break;
+        dirty_free = (uint16_t)(free_slots & ~arena_slab_released_slots(candidate, per_page));
+        if (dirty_free) {
+            slab = candidate;
+            slot = __builtin_ctz(dirty_free);
+            break;
+        }
+        if (!fallback)
+            fallback = candidate;
+    }
+    if (!slab && fallback) {
+        slab = fallback;
+        slot = __builtin_ctz((unsigned)(~slab->used) & JS_ARENA_SLAB_FULL);
+    }
+    if (!slab) {
+        if (s->spare_slab) {
+            slab = s->spare_slab;
+            s->spare_slab = NULL;
+        } else {
+            void *base = mmap(NULL, JS_ARENA_SLAB_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, JS_ARENA_SLAB_TAG, 0);
+            if (base == MAP_FAILED)
+                return NULL;
+            slab = rt->mf.js_malloc(rt->malloc_state.opaque, sizeof(JSArenaSlab));
+            if (!slab) {
+                munmap(base, JS_ARENA_SLAB_BYTES);
+                return NULL;
+            }
+            slab->base = base;
+            slab->used = 0;
+            slab->released = 0;
+        }
+        list_add(&slab->link, &s->slab_list);
+        slot = __builtin_ctz((unsigned)(~slab->used) & JS_ARENA_SLAB_FULL);
+    }
+    slab->used |= (uint16_t)(1u << slot);
+    if (per_page) {
+        page = slot / per_page;
+        if (slab->released & (1u << page)) {
+#if defined(__APPLE__)
+            madvise(slab->base + (size_t)page * per_page * JS_ARENA_SIZE, (size_t)per_page * JS_ARENA_SIZE, MADV_FREE_REUSE);
+#endif
+            slab->released &= (uint16_t)~(1u << page);
+        }
+    }
+    if (slab->used == JS_ARENA_SLAB_FULL) {
+        list_del(&slab->link);
+        list_add_tail(&slab->link, &s->slab_list);
+    }
+    JSArena *ar = (JSArena *)(slab->base + (size_t)slot * JS_ARENA_SIZE);
+    ar->slab = slab;
+    return ar;
+}
+
+static void arena_slab_give_back(JSRuntime *rt, JSArena *ar)
+{
+    JSArenaState *s = &rt->arena_state;
+    JSArenaSlab *slab = ar->slab;
+    int slot = (int)(((uint8_t *)ar - slab->base) / JS_ARENA_SIZE);
+    int per_page = arena_slots_per_page();
+    bool was_full = slab->used == JS_ARENA_SLAB_FULL;
+    slab->used &= (uint16_t)~(1u << slot);
+    if (slab->used == 0) {
+        list_del(&slab->link);
+        if (s->spare_slab) {
+            arena_slab_destroy(rt, slab);
+        } else {
+            arena_slab_release_pages(slab, JS_ARENA_SLAB_FULL);
+            s->spare_slab = slab;
+        }
+        return;
+    }
+    if (was_full) {
+        list_del(&slab->link);
+        list_add(&slab->link, &s->slab_list);
+    }
+    if (per_page) {
+        int page = slot / per_page;
+        uint16_t page_slots = (uint16_t)(((1u << per_page) - 1) << (page * per_page));
+        if (!(slab->used & page_slots))
+            arena_slab_release_pages(slab, (uint16_t)(1u << page));
+    }
+}
+#endif
 
 static inline void *arena_get_block(JSArena *ar, unsigned int idx,
                                     unsigned int block_size)
@@ -1761,8 +1944,12 @@ static no_inline JSArena *arena_new(JSRuntime *rt, int block_size_idx)
 
     block_size = arena_block_sizes[block_size_idx];
     n_blocks = (JS_ARENA_SIZE - sizeof(JSArena)) / block_size;
+#ifdef JS_ARENA_SLABS
+    ar = arena_slab_take(rt);
+#else
     ar = rt->mf.js_malloc(rt->malloc_state.opaque,
                           sizeof(JSArena) + (size_t)n_blocks * block_size);
+#endif
     if (!ar)
         return NULL;
     ar->block_size_idx = block_size_idx;
@@ -1875,7 +2062,11 @@ static void js_arena_free(JSRuntime *rt, void *ptr)
         if (unlikely(ar->n_used_blocks == 0)) {
             list_del(&ar->link);
             list_del(&ar->free_link);
+#ifdef JS_ARENA_SLABS
+            arena_slab_give_back(rt, ar);
+#else
             rt->mf.js_free(rt->malloc_state.opaque, ar);
+#endif
         }
     }
 }
@@ -1974,13 +2165,26 @@ static void js_arena_free_all(JSRuntime *rt)
     struct list_head *el, *el1;
     int i;
     for (i = 0; i < JS_ARENA_BLOCK_SIZE_COUNT; i++) {
+#ifndef JS_ARENA_SLABS
         list_for_each_safe(el, el1, &s->arena_list[i]) {
             JSArena *ar = list_entry(el, JSArena, link);
             rt->mf.js_free(rt->malloc_state.opaque, ar);
         }
+#endif
         init_list_head(&s->arena_list[i]);
         init_list_head(&s->free_arena_list[i]);
     }
+#ifdef JS_ARENA_SLABS
+    list_for_each_safe(el, el1, &s->slab_list) {
+        JSArenaSlab *slab = list_entry(el, JSArenaSlab, link);
+        arena_slab_destroy(rt, slab);
+    }
+    init_list_head(&s->slab_list);
+    if (s->spare_slab) {
+        arena_slab_destroy(rt, s->spare_slab);
+        s->spare_slab = NULL;
+    }
+#endif
 }
 
 void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
