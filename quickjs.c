@@ -36753,6 +36753,16 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     if (line2 >= 0) line_num = line2;
                     break;
                 }
+                /* Transformation: dup put_loc_check(n) drop -> put_loc_check(n) */
+                if (code_match(&cc, pos_next, OP_put_loc_check, -1, OP_drop, -1)) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_put_loc_check);
+                    dbuf_put_u16(&bc_out, cc.idx);
+                    pos_next = cc.pos;
+                    break;
+                }
             }
             goto no_change;
 
@@ -36902,6 +36912,17 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
                     dbuf_putc(&bc_out, OP_dec + (op - OP_post_dec));
                     put_short_code(&bc_out, op1, idx);
+                    break;
+                }
+                /* post_inc put_loc_check(n) drop -> inc put_loc_check(n) */
+                if (code_match(&cc, pos_next, OP_put_loc_check, -1, OP_drop, -1)) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_dec + (op - OP_post_dec));
+                    dbuf_putc(&bc_out, OP_put_loc_check);
+                    dbuf_put_u16(&bc_out, cc.idx);
+                    pos_next = cc.pos;
                     break;
                 }
                 if (code_match(&cc, pos_next, OP_perm3, OP_put_field, OP_drop, -1)) {
