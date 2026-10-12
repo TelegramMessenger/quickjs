@@ -18533,6 +18533,23 @@ static no_inline int js_put_field_add(JSContext *ctx, JSObject *p, JSAtom atom,
     return 1;
 }
 
+/* true if the exotic behavior of 'p' cannot apply to the key 'atom' when
+   reading it: arrays, arguments and String objects are only exotic for
+   array indexes, so the lookup can go on with their own properties and
+   prototype */
+static inline bool js_exotic_skip_for_key(JSObject *p, JSAtom atom)
+{
+    switch(p->class_id) {
+    case JS_CLASS_ARRAY:
+    case JS_CLASS_ARGUMENTS:
+    case JS_CLASS_MAPPED_ARGUMENTS:
+    case JS_CLASS_STRING:
+        return !__JS_AtomIsTaggedInt(atom);
+    default:
+        return false;
+    }
+}
+
 /* call from an opcode: C functions are called directly, which skips the
    frame setup of JS_CallInternal and the indirect class call */
 static inline JSValue js_call_interp(JSContext *ctx, JSValueConst func_obj,
@@ -18766,7 +18783,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             val = js_dup(pr->u.value);
                             break;
                         }
-                        if (unlikely(p->is_exotic)) {
+                        if (unlikely(p->is_exotic) &&
+                            !js_exotic_skip_for_key(p, atom)) {
                             obj = JS_MKPTR(JS_TAG_OBJECT, p);
                             goto get_length_slow_path;
                         }
@@ -20088,10 +20106,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             val = js_dup(pr->u.value);
                             break;
                         }
-                        if (unlikely(p->is_exotic)) {
-                            /* XXX: should avoid the slow path for arrays
-                               and typed arrays by ensuring that 'prop' is
-                               not numeric */
+                        if (unlikely(p->is_exotic) &&
+                            !js_exotic_skip_for_key(p, atom)) {
                             obj = JS_MKPTR(JS_TAG_OBJECT, p);
                             goto get_field_slow_path;
                         }
@@ -20136,10 +20152,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             val = js_dup(pr->u.value);
                             break;
                         }
-                        if (unlikely(p->is_exotic)) {
-                            /* XXX: should avoid the slow path for arrays
-                               and typed arrays by ensuring that 'prop' is
-                               not numeric */
+                        if (unlikely(p->is_exotic) &&
+                            !js_exotic_skip_for_key(p, atom)) {
                             obj = JS_MKPTR(JS_TAG_OBJECT, p);
                             goto get_field2_slow_path;
                         }
