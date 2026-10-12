@@ -52098,6 +52098,20 @@ static JSValue JS_ToQuotedStringFree(JSContext *ctx, JSValue val) {
     return r;
 }
 
+/* false if no object of the prototype chain of 'p' can have a toJSON
+   property: plain objects and arrays without one, so that JSON.stringify
+   does not do a full property lookup for every object and array */
+static bool js_json_may_have_toJSON(JSObject *p)
+{
+    for(; p != NULL; p = p->shape->proto) {
+        if (p->is_exotic && !js_exotic_skip_for_key(p, JS_ATOM_toJSON))
+            return true;
+        if (find_own_property1(p, JS_ATOM_toJSON))
+            return true;
+    }
+    return false;
+}
+
 static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
                              JSValueConst holder, JSValue val,
                              JSValueConst key)
@@ -52105,7 +52119,8 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
     JSValue v;
     JSValueConst args[2];
 
-    if (JS_IsObject(val) || JS_IsBigInt(val)) {
+    if ((JS_IsObject(val) && js_json_may_have_toJSON(JS_VALUE_GET_OBJ(val))) ||
+        JS_IsBigInt(val)) {
 		JSValue f = JS_GetProperty(ctx, val, JS_ATOM_toJSON);
 		if (JS_IsException(f))
 			goto exception;
