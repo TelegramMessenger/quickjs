@@ -14716,7 +14716,7 @@ static JSValue JS_ToStringCheckObject(JSContext *ctx, JSValueConst val)
 }
 
 /* append JSON.stringify's quoted form of p to b */
-static int string_buffer_put_quoted(StringBuffer *b, JSString *p)
+static no_inline int string_buffer_put_quoted(StringBuffer *b, JSString *p)
 {
     int i, j;
     uint32_t c;
@@ -49332,7 +49332,8 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
             return JS_ThrowSyntaxError(ctx, "invalid regular expression flags");
 
     cache_slot = -1;
-    if (JS_VALUE_GET_TAG(pattern) == JS_TAG_STRING) {
+    if (JS_VALUE_GET_TAG(pattern) == JS_TAG_STRING &&
+        JS_VALUE_GET_STRING(pattern)->len <= 1024) {
         JSString *ps = JS_VALUE_GET_STRING(pattern);
         cache_slot = (hash_string(ps, re_flags) * 0x9e3779b1u) >> (32 - 4);
         if (ctx->regexp_cache[cache_slot].pattern &&
@@ -51632,6 +51633,42 @@ exception:
     return JS_EXCEPTION;
 }
 
+/* sep followed by the quoted key */
+static no_inline int json_write_key(JSContext *ctx, StringBuffer *b,
+                                    JSValueConst sep, JSValueConst prop)
+{
+    JSValue q;
+
+    string_buffer_concat_value(b, sep);
+    if (JS_VALUE_GET_TAG(prop) == JS_TAG_STRING)
+        return string_buffer_put_quoted(b, JS_VALUE_GET_STRING(prop));
+    q = JS_ToQuotedString(ctx, prop);
+    if (JS_IsException(q))
+        return -1;
+    string_buffer_concat_value(b, q);
+    JS_FreeValue(ctx, q);
+    return 0;
+}
+
+/* number formatting with its buffers outside js_json_to_str's recursive frame */
+static no_inline int json_write_number(StringBuffer *b, JSValueConst val)
+{
+    char buf[128];
+    JSDTOATempMem dtoa_mem;
+    double d;
+    int len;
+
+    if (JS_VALUE_GET_TAG(val) == JS_TAG_INT) {
+        len = i32toa(buf, JS_VALUE_GET_INT(val));
+    } else {
+        d = JS_VALUE_GET_FLOAT64(val);
+        if (js_dtoa_max_len(d, 10, 0, JS_DTOA_FORMAT_FREE) > (int)sizeof(buf) - 1)
+            return string_buffer_concat_value(b, val);
+        len = js_dtoa(buf, d, 10, 0, JS_DTOA_FORMAT_FREE, &dtoa_mem);
+    }
+    return string_buffer_write8(b, (uint8_t *)buf, len);
+}
+
 static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                           JSValueConst holder, JSValue val,
                           JSValueConst indent)
@@ -51765,20 +51802,9 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                 if (!JS_IsUndefined(v)) {
                     if (has_content)
                         string_buffer_putc8(jsc->b, ',');
-                    if (JS_VALUE_GET_TAG(prop) == JS_TAG_STRING) {
-                        string_buffer_concat_value(jsc->b, sep);
-                        if (string_buffer_put_quoted(jsc->b, JS_VALUE_GET_STRING(prop))) {
-                            JS_FreeValue(ctx, v);
-                            goto exception;
-                        }
-                    } else {
-                        prop = JS_ToQuotedStringFree(ctx, prop);
-                        if (JS_IsException(prop)) {
-                            JS_FreeValue(ctx, v);
-                            goto exception;
-                        }
-                        string_buffer_concat_value(jsc->b, sep);
-                        string_buffer_concat_value(jsc->b, prop);
+                    if (json_write_key(ctx, jsc->b, sep, prop)) {
+                        JS_FreeValue(ctx, v);
+                        goto exception;
                     }
                     string_buffer_putc8(jsc->b, ':');
                     string_buffer_concat_value(jsc->b, sep1);
@@ -51818,21 +51844,10 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
         if (!isfinite(JS_VALUE_GET_FLOAT64(val))) {
             val = JS_NULL;
             goto concat_value;
-        } else {
-            char nbuf[128];
-            JSDTOATempMem dtoa_mem;
-            double d = JS_VALUE_GET_FLOAT64(val);
-            if (js_dtoa_max_len(d, 10, 0, JS_DTOA_FORMAT_FREE) > (int)sizeof(nbuf) - 1)
-                goto concat_value;
-            return string_buffer_write8(jsc->b, (uint8_t *)nbuf,
-                                        js_dtoa(nbuf, d, 10, 0, JS_DTOA_FORMAT_FREE, &dtoa_mem));
         }
+        return json_write_number(jsc->b, val);
     case JS_TAG_INT:
-        {
-            char nbuf[16];
-            return string_buffer_write8(jsc->b, (uint8_t *)nbuf,
-                                        i32toa(nbuf, JS_VALUE_GET_INT(val)));
-        }
+        return json_write_number(jsc->b, val);
     case JS_TAG_BOOL:
     case JS_TAG_NULL:
     concat_value:
