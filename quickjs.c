@@ -9443,6 +9443,15 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                         JSValue func = JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter);
                         /* Note: the field could be removed in the getter */
                         func = js_dup(func);
+                        if (pr->u.getset.getter->class_id == JS_CLASS_C_FUNCTION) {
+                            JSValue ret = JS_UNDEFINED;
+                            if (!js_poll_interrupts(ctx))
+                                ret = js_call_c_function(ctx, func, this_obj, 0, NULL, 0);
+                            else
+                                ret = JS_EXCEPTION;
+                            JS_FreeValue(ctx, func);
+                            return ret;
+                        }
                         return JS_CallFree(ctx, func, this_obj, 0, NULL);
                     }
                 } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
@@ -18566,8 +18575,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     stack_buf = var_buf + b->var_count;
     sf->var_refs = (JSVarRef **)(stack_buf + b->stack_size);
     sf->var_ref_count = b->var_ref_count;
-    for(i = 0; i < b->var_ref_count; i++)
-        sf->var_refs[i] = NULL;
+    if (b->var_ref_count) {
+        /* few slots: plain stores instead of the bzero call the compiler
+           turns a loop into */
+        JSVarRef **vr = sf->var_refs;
+        switch(b->var_ref_count) {
+        case 4: vr[3] = NULL; /* fall through */
+        case 3: vr[2] = NULL; /* fall through */
+        case 2: vr[1] = NULL; /* fall through */
+        case 1: vr[0] = NULL; break;
+        default: memset(vr, 0, sizeof(vr[0]) * b->var_ref_count); break;
+        }
+    }
     /* ordinary C-stack frame: not owned by a coroutine GC object */
     sf->cur_gc_obj = NULL;
     sp = stack_buf;
