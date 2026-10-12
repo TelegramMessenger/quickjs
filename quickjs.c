@@ -18808,8 +18808,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
         CASE(OP_push_atom_value):
-            *sp++ = JS_AtomToValue(ctx, get_u32(pc));
-            pc += 4;
+            {
+                JSAtom atom = get_u32(pc);
+                JSAtomStruct *ap;
+                pc += 4;
+                if (likely(!__JS_AtomIsTaggedInt(atom)) &&
+                    (ap = rt->atom_array[atom])->atom_type == JS_ATOM_TYPE_STRING) {
+                    *sp++ = js_dup(JS_MKPTR(JS_TAG_STRING, ap));
+                } else {
+                    *sp++ = JS_AtomToValue(ctx, atom);
+                }
+            }
             BREAK;
         CASE(OP_undefined):
             *sp++ = JS_UNDEFINED;
