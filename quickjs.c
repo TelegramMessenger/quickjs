@@ -1791,11 +1791,13 @@ static void js_arena_init(JSRuntime *rt)
 static size_t arena_page_size(void)
 {
     static size_t page_size;
-    if (!page_size) {
+    size_t size = __atomic_load_n(&page_size, __ATOMIC_RELAXED);
+    if (!size) {
         long v = sysconf(_SC_PAGESIZE);
-        page_size = v > 0 ? (size_t)v : 4096;
+        size = v > 0 ? (size_t)v : 4096;
+        __atomic_store_n(&page_size, size, __ATOMIC_RELAXED);
     }
-    return page_size;
+    return size;
 }
 
 static int arena_slots_per_page(void)
