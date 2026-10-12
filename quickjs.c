@@ -18430,6 +18430,21 @@ static inline bool js_put_fast_typed_array_element(JSObject *p, uint32_t idx,
     }
 }
 
+/* call from an opcode: C functions are called directly, which skips the
+   frame setup of JS_CallInternal and the indirect class call */
+static inline JSValue js_call_interp(JSContext *ctx, JSValueConst func_obj,
+                                     JSValueConst this_obj, int argc,
+                                     JSValueConst *argv)
+{
+    if (likely(JS_VALUE_GET_TAG(func_obj) == JS_TAG_OBJECT) &&
+        JS_VALUE_GET_OBJ(func_obj)->class_id == JS_CLASS_C_FUNCTION) {
+        if (js_poll_interrupts(ctx))
+            return JS_EXCEPTION;
+        return js_call_c_function(ctx, func_obj, this_obj, argc, argv, 0);
+    }
+    return JS_CallInternal(ctx, func_obj, this_obj, JS_UNDEFINED, argc, argv, 0);
+}
+
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
@@ -18931,9 +18946,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             has_call_argc:
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
-                                          JS_UNDEFINED, call_argc,
-                                          vc(call_argv), 0);
+                ret_val = js_call_interp(ctx, call_argv[-1], JS_UNDEFINED,
+                                         call_argc, vc(call_argv));
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 if (opcode == OP_tail_call)
@@ -18968,9 +18982,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
-                                          JS_UNDEFINED, call_argc,
-                                          vc(call_argv), 0);
+                ret_val = js_call_interp(ctx, call_argv[-1], call_argv[-2],
+                                         call_argc, vc(call_argv));
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 if (opcode == OP_tail_call_method)
