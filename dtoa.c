@@ -1104,6 +1104,270 @@ static void dtoa_free(void *ptr)
 #endif
 
 /* return the length */
+/* Grisu3 (Florian Loitsch, "Printing Floating-Point Numbers Quickly and
+   Accurately with Integers", 2010) for the shortest base 10 output. It
+   either produces the shortest digit string that is the closest to the
+   value or reports failure (about 0.5% of the inputs), in which case the
+   exact multi-precision path below is used. */
+
+typedef struct {
+    uint64_t f;
+    int e;
+} dtoa_diyfp;
+
+typedef struct {
+    uint64_t f;
+    int16_t e;
+    int16_t k;
+} dtoa_cached_pow10;
+
+/* 10^k for k = -348, -340, ..., 340: 64 bit significand rounded to
+   nearest and binary exponent */
+static const dtoa_cached_pow10 dtoa_cached_pow10_table[] = {
+    { 0xfa8fd5a0081c0288ULL, -1220, -348 },
+    { 0xbaaee17fa23ebf76ULL, -1193, -340 },
+    { 0x8b16fb203055ac76ULL, -1166, -332 },
+    { 0xcf42894a5dce35eaULL, -1140, -324 },
+    { 0x9a6bb0aa55653b2dULL, -1113, -316 },
+    { 0xe61acf033d1a45dfULL, -1087, -308 },
+    { 0xab70fe17c79ac6caULL, -1060, -300 },
+    { 0xff77b1fcbebcdc4fULL, -1034, -292 },
+    { 0xbe5691ef416bd60cULL, -1007, -284 },
+    { 0x8dd01fad907ffc3cULL, -980, -276 },
+    { 0xd3515c2831559a83ULL, -954, -268 },
+    { 0x9d71ac8fada6c9b5ULL, -927, -260 },
+    { 0xea9c227723ee8bcbULL, -901, -252 },
+    { 0xaecc49914078536dULL, -874, -244 },
+    { 0x823c12795db6ce57ULL, -847, -236 },
+    { 0xc21094364dfb5637ULL, -821, -228 },
+    { 0x9096ea6f3848984fULL, -794, -220 },
+    { 0xd77485cb25823ac7ULL, -768, -212 },
+    { 0xa086cfcd97bf97f4ULL, -741, -204 },
+    { 0xef340a98172aace5ULL, -715, -196 },
+    { 0xb23867fb2a35b28eULL, -688, -188 },
+    { 0x84c8d4dfd2c63f3bULL, -661, -180 },
+    { 0xc5dd44271ad3cdbaULL, -635, -172 },
+    { 0x936b9fcebb25c996ULL, -608, -164 },
+    { 0xdbac6c247d62a584ULL, -582, -156 },
+    { 0xa3ab66580d5fdaf6ULL, -555, -148 },
+    { 0xf3e2f893dec3f126ULL, -529, -140 },
+    { 0xb5b5ada8aaff80b8ULL, -502, -132 },
+    { 0x87625f056c7c4a8bULL, -475, -124 },
+    { 0xc9bcff6034c13053ULL, -449, -116 },
+    { 0x964e858c91ba2655ULL, -422, -108 },
+    { 0xdff9772470297ebdULL, -396, -100 },
+    { 0xa6dfbd9fb8e5b88fULL, -369, -92 },
+    { 0xf8a95fcf88747d94ULL, -343, -84 },
+    { 0xb94470938fa89bcfULL, -316, -76 },
+    { 0x8a08f0f8bf0f156bULL, -289, -68 },
+    { 0xcdb02555653131b6ULL, -263, -60 },
+    { 0x993fe2c6d07b7facULL, -236, -52 },
+    { 0xe45c10c42a2b3b06ULL, -210, -44 },
+    { 0xaa242499697392d3ULL, -183, -36 },
+    { 0xfd87b5f28300ca0eULL, -157, -28 },
+    { 0xbce5086492111aebULL, -130, -20 },
+    { 0x8cbccc096f5088ccULL, -103, -12 },
+    { 0xd1b71758e219652cULL, -77, -4 },
+    { 0x9c40000000000000ULL, -50, 4 },
+    { 0xe8d4a51000000000ULL, -24, 12 },
+    { 0xad78ebc5ac620000ULL, 3, 20 },
+    { 0x813f3978f8940984ULL, 30, 28 },
+    { 0xc097ce7bc90715b3ULL, 56, 36 },
+    { 0x8f7e32ce7bea5c70ULL, 83, 44 },
+    { 0xd5d238a4abe98068ULL, 109, 52 },
+    { 0x9f4f2726179a2245ULL, 136, 60 },
+    { 0xed63a231d4c4fb27ULL, 162, 68 },
+    { 0xb0de65388cc8ada8ULL, 189, 76 },
+    { 0x83c7088e1aab65dbULL, 216, 84 },
+    { 0xc45d1df942711d9aULL, 242, 92 },
+    { 0x924d692ca61be758ULL, 269, 100 },
+    { 0xda01ee641a708deaULL, 295, 108 },
+    { 0xa26da3999aef774aULL, 322, 116 },
+    { 0xf209787bb47d6b85ULL, 348, 124 },
+    { 0xb454e4a179dd1877ULL, 375, 132 },
+    { 0x865b86925b9bc5c2ULL, 402, 140 },
+    { 0xc83553c5c8965d3dULL, 428, 148 },
+    { 0x952ab45cfa97a0b3ULL, 455, 156 },
+    { 0xde469fbd99a05fe3ULL, 481, 164 },
+    { 0xa59bc234db398c25ULL, 508, 172 },
+    { 0xf6c69a72a3989f5cULL, 534, 180 },
+    { 0xb7dcbf5354e9beceULL, 561, 188 },
+    { 0x88fcf317f22241e2ULL, 588, 196 },
+    { 0xcc20ce9bd35c78a5ULL, 614, 204 },
+    { 0x98165af37b2153dfULL, 641, 212 },
+    { 0xe2a0b5dc971f303aULL, 667, 220 },
+    { 0xa8d9d1535ce3b396ULL, 694, 228 },
+    { 0xfb9b7cd9a4a7443cULL, 720, 236 },
+    { 0xbb764c4ca7a44410ULL, 747, 244 },
+    { 0x8bab8eefb6409c1aULL, 774, 252 },
+    { 0xd01fef10a657842cULL, 800, 260 },
+    { 0x9b10a4e5e9913129ULL, 827, 268 },
+    { 0xe7109bfba19c0c9dULL, 853, 276 },
+    { 0xac2820d9623bf429ULL, 880, 284 },
+    { 0x80444b5e7aa7cf85ULL, 907, 292 },
+    { 0xbf21e44003acdd2dULL, 933, 300 },
+    { 0x8e679c2f5e44ff8fULL, 960, 308 },
+    { 0xd433179d9c8cb841ULL, 986, 316 },
+    { 0x9e19db92b4e31ba9ULL, 1013, 324 },
+    { 0xeb96bf6ebadf77d9ULL, 1039, 332 },
+    { 0xaf87023b9bf0ee6bULL, 1066, 340 }
+};
+
+#define DTOA_GRISU_MIN_TARGET_EXP (-60)
+#define DTOA_GRISU_MAX_TARGET_EXP (-32)
+
+static dtoa_diyfp dtoa_diyfp_mul(dtoa_diyfp x, dtoa_diyfp y)
+{
+    const uint64_t M32 = 0xffffffffu;
+    uint64_t a = x.f >> 32, b = x.f & M32, c = y.f >> 32, d = y.f & M32;
+    uint64_t ac = a * c, bc = b * c, ad = a * d, bd = b * d;
+    uint64_t tmp = (bd >> 32) + (ad & M32) + (bc & M32);
+    dtoa_diyfp r;
+    tmp += (uint64_t)1 << 31;
+    r.f = ac + (ad >> 32) + (bc >> 32) + (tmp >> 32);
+    r.e = x.e + y.e + 64;
+    return r;
+}
+
+static dtoa_diyfp dtoa_diyfp_normalize(dtoa_diyfp x)
+{
+    int s = clz64(x.f);
+    x.f <<= s;
+    x.e -= s;
+    return x;
+}
+
+static bool dtoa_grisu_round_weed(char *buf, int len, uint64_t distance_too_high_w,
+                                  uint64_t unsafe_interval, uint64_t rest,
+                                  uint64_t ten_kappa, uint64_t unit)
+{
+    uint64_t small_distance = distance_too_high_w - unit;
+    uint64_t big_distance = distance_too_high_w + unit;
+    while (rest < small_distance &&
+           unsafe_interval - rest >= ten_kappa &&
+           (rest + ten_kappa < small_distance ||
+            small_distance - rest >= rest + ten_kappa - small_distance)) {
+        buf[len - 1]--;
+        rest += ten_kappa;
+    }
+    if (rest < big_distance &&
+        unsafe_interval - rest >= ten_kappa &&
+        (rest + ten_kappa < big_distance ||
+         big_distance - rest > rest + ten_kappa - big_distance)) {
+        return false;
+    }
+    return 2 * unit <= rest && rest <= unsafe_interval - 4 * unit;
+}
+
+/* 'd' is finite, non zero and positive. On success, return the number of
+   digits written to 'buf' (at most 17) and set '*pk' so that d = buf * 10^k */
+static int dtoa_grisu3(double d, char *buf, int *pk)
+{
+    static const uint32_t small_pow10[] = {
+        0, 1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000,
+        1000000000,
+    };
+    uint64_t a = float64_as_uint64(d);
+    int biased_e = (a >> 52) & 0x7ff;
+    uint64_t sig = a & (((uint64_t)1 << 52) - 1);
+    dtoa_diyfp v, w, m_plus, m_minus, c, low, high, too_low, too_high, one;
+    uint64_t unsafe_interval, fractionals, rest, unit;
+    uint32_t integrals, divisor;
+    int min_e, idx, kappa, len, mk;
+
+    if (biased_e == 0) {
+        v.f = sig;
+        v.e = 1 - 1075;
+    } else {
+        v.f = sig | ((uint64_t)1 << 52);
+        v.e = biased_e - 1075;
+    }
+    w = dtoa_diyfp_normalize(v);
+    m_plus.f = (v.f << 1) + 1;
+    m_plus.e = v.e - 1;
+    m_plus = dtoa_diyfp_normalize(m_plus);
+    if (sig == 0 && biased_e > 1) {
+        m_minus.f = (v.f << 2) - 1;
+        m_minus.e = v.e - 2;
+    } else {
+        m_minus.f = (v.f << 1) - 1;
+        m_minus.e = v.e - 1;
+    }
+    m_minus.f <<= m_minus.e - m_plus.e;
+    m_minus.e = m_plus.e;
+
+    /* cached power c = 10^-mk such that the exponent of w * c is in
+       [DTOA_GRISU_MIN_TARGET_EXP, DTOA_GRISU_MAX_TARGET_EXP] */
+    min_e = DTOA_GRISU_MIN_TARGET_EXP - (w.e + 64);
+    idx = (int)((((int64_t)(min_e + 63) * 78913) >> 18) + 348 + 7) / 8;
+    if (idx < 0)
+        idx = 0;
+    if (idx > (int)countof(dtoa_cached_pow10_table) - 1)
+        idx = countof(dtoa_cached_pow10_table) - 1;
+    while (idx > 0 && dtoa_cached_pow10_table[idx].e > DTOA_GRISU_MAX_TARGET_EXP - (w.e + 64))
+        idx--;
+    while (idx < (int)countof(dtoa_cached_pow10_table) - 1 && dtoa_cached_pow10_table[idx].e < min_e)
+        idx++;
+    if (dtoa_cached_pow10_table[idx].e < min_e ||
+        dtoa_cached_pow10_table[idx].e > DTOA_GRISU_MAX_TARGET_EXP - (w.e + 64))
+        return 0;
+    c.f = dtoa_cached_pow10_table[idx].f;
+    c.e = dtoa_cached_pow10_table[idx].e;
+    mk = -dtoa_cached_pow10_table[idx].k;
+
+    w = dtoa_diyfp_mul(w, c);
+    low = dtoa_diyfp_mul(m_minus, c);
+    high = dtoa_diyfp_mul(m_plus, c);
+
+    /* digit generation */
+    unit = 1;
+    too_low.f = low.f - unit;
+    too_low.e = low.e;
+    too_high.f = high.f + unit;
+    too_high.e = high.e;
+    unsafe_interval = too_high.f - too_low.f;
+    one.e = w.e;
+    one.f = (uint64_t)1 << -one.e;
+    integrals = (uint32_t)(too_high.f >> -one.e);
+    fractionals = too_high.f & (one.f - 1);
+    kappa = 10;
+    while (kappa > 0 && integrals < small_pow10[kappa])
+        kappa--;
+    divisor = small_pow10[kappa];
+    len = 0;
+    while (kappa > 0) {
+        buf[len++] = '0' + integrals / divisor;
+        integrals %= divisor;
+        kappa--;
+        rest = ((uint64_t)integrals << -one.e) + fractionals;
+        if (rest < unsafe_interval) {
+            if (!dtoa_grisu_round_weed(buf, len, too_high.f - w.f, unsafe_interval,
+                                       rest, (uint64_t)divisor << -one.e, unit))
+                return 0;
+            *pk = mk + kappa;
+            return len;
+        }
+        divisor /= 10;
+    }
+    for(;;) {
+        fractionals *= 10;
+        unit *= 10;
+        unsafe_interval *= 10;
+        buf[len++] = '0' + (int)(fractionals >> -one.e);
+        fractionals &= one.f - 1;
+        kappa--;
+        if (fractionals < unsafe_interval) {
+            if (!dtoa_grisu_round_weed(buf, len, (too_high.f - w.f) * unit,
+                                       unsafe_interval, fractionals, one.f, unit))
+                return 0;
+            *pk = mk + kappa;
+            return len;
+        }
+        if (len >= 17)
+            return 0;
+    }
+}
+
 int js_dtoa(char *buf, double d, int radix, int n_digits, int flags,
             JSDTOATempMem *tmp_mem)
 {
@@ -1180,6 +1444,53 @@ int js_dtoa(char *buf, double d, int radix, int n_digits, int flags,
        B^(P-1) <= F < 2.B^P. */
     E = 1 + mul_log2_radix(e - 1, radix);
     
+    if (fmt == JS_DTOA_FORMAT_FREE && radix == 10) {
+        char digits[20];
+        int k, n = dtoa_grisu3(fabs(d), digits, &k);
+        if (n > 0) {
+            while (digits[n - 1] == '0')
+                n--;
+            E = n + k;
+            if ((flags & JS_DTOA_EXP_MASK) == JS_DTOA_EXP_ENABLED ||
+                ((flags & JS_DTOA_EXP_MASK) == JS_DTOA_EXP_AUTO &&
+                 (E <= -6 || E > dtoa_max_digits_table[10 - 2] + 4))) {
+                *q++ = digits[0];
+                if (n > 1) {
+                    *q++ = '.';
+                    memcpy(q, digits + 1, n - 1);
+                    q += n - 1;
+                }
+                *q++ = 'e';
+                E--;
+                if (E < 0) {
+                    *q++ = '-';
+                    E = -E;
+                } else {
+                    *q++ = '+';
+                }
+                q += u32toa(q, E);
+            } else if (E <= 0) {
+                *q++ = '0';
+                *q++ = '.';
+                for(i = 0; i < -E; i++)
+                    *q++ = '0';
+                memcpy(q, digits, n);
+                q += n;
+            } else if (E >= n) {
+                memcpy(q, digits, n);
+                q += n;
+                for(i = 0; i < E - n; i++)
+                    *q++ = '0';
+            } else {
+                memcpy(q, digits, E);
+                q += E;
+                *q++ = '.';
+                memcpy(q, digits + E, n - E);
+                q += n - E;
+            }
+            goto done;
+        }
+    }
     if (fmt == JS_DTOA_FORMAT_FREE) {
         int P_max, E0, e1, E_found, P_found;
         uint64_t m1, mant_found, mant, mant_max1;
