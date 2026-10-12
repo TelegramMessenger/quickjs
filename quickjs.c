@@ -387,6 +387,11 @@ struct JSRuntime {
     /* list of JSGCObjectHeader.link. List of allocated GC objects (used
        by the garbage collector) */
     struct list_head gc_obj_list;
+    /* hashed shapes whose reference count dropped to zero, kept in the
+       shape hash table until the next GC so that objects built with the
+       same layout reuse them instead of rebuilding the transitions */
+    struct list_head shape_zombie_list;
+    int shape_zombie_count;
     /* list of JSGCObjectHeader.link. Used during JS_FreeValueRT() */
     struct list_head gc_zero_ref_count_list;
     struct list_head tmp_obj_list; /* used during GC */
@@ -2546,6 +2551,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
+    init_list_head(&rt->shape_zombie_list);
     init_list_head(&rt->gc_zero_ref_count_list);
     rt->gc_phase = JS_GC_PHASE_NONE;
 
@@ -6051,9 +6057,43 @@ static void js_free_shape0(JSRuntime *rt, JSShape *sh)
     js_free_rt(rt, get_alloc_from_shape(sh));
 }
 
+#define JS_SHAPE_ZOMBIE_MAX 64
+
 static void js_free_shape(JSRuntime *rt, JSShape *sh)
 {
     if (unlikely(--JS_REF_COUNT(sh) <= 0)) {
+        if (sh->is_hashed && !rt->in_free && rt->gc_phase == JS_GC_PHASE_NONE) {
+            /* keep it findable: the next object with this layout revives it */
+            list_del(&sh->header.link);
+            list_add_tail(&sh->header.link, &rt->shape_zombie_list);
+            if (++rt->shape_zombie_count > JS_SHAPE_ZOMBIE_MAX) {
+                JSShape *old = list_entry(rt->shape_zombie_list.next, JSShape, header.link);
+                rt->shape_zombie_count--;
+                js_free_shape0(rt, old);
+            }
+        } else {
+            js_free_shape0(rt, sh);
+        }
+    }
+}
+
+/* a shape returned by the shape hash table may have no reference: put it
+   back on the GC object list before the caller takes one */
+static inline JSShape *js_revive_shape(JSRuntime *rt, JSShape *sh)
+{
+    if (unlikely(JS_REF_COUNT(sh) == 0)) {
+        list_del(&sh->header.link);
+        rt->shape_zombie_count--;
+        add_gc_object(rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
+    }
+    return sh;
+}
+
+static void js_free_shape_zombies(JSRuntime *rt)
+{
+    while (!list_empty(&rt->shape_zombie_list)) {
+        JSShape *sh = list_entry(rt->shape_zombie_list.next, JSShape, header.link);
+        rt->shape_zombie_count--;
         js_free_shape0(rt, sh);
     }
 }
@@ -6485,7 +6525,7 @@ JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
     proto = object_or_null(proto_val);
     sh = find_hashed_shape_proto(ctx->rt, proto);
     if (likely(sh)) {
-        sh = js_dup_shape(sh);
+        sh = js_dup_shape(js_revive_shape(ctx->rt, sh));
     } else {
         sh = js_new_shape(ctx, proto);
         if (!sh)
@@ -7705,6 +7745,8 @@ static void gc_free_cycles(JSRuntime *rt)
 
 void JS_RunGC(JSRuntime *rt)
 {
+    js_free_shape_zombies(rt);
+
     /* decrement the reference of the children of each object. mark =
        1 after this pass. */
     gc_decref(rt);
@@ -10402,7 +10444,7 @@ static JSProperty *add_property(JSContext *ctx,
                     return NULL;
                 p->prop = new_prop;
             }
-            p->shape = js_dup_shape(new_sh);
+            p->shape = js_dup_shape(js_revive_shape(ctx->rt, new_sh));
             js_free_shape(ctx->rt, sh);
             return &p->prop[new_sh->prop_count - 1];
         } else if (JS_REF_COUNT(sh) != 1) {
@@ -20091,6 +20133,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 atom = get_u32(pc);
                 pc += 4;
 
+                if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT)) {
+                    JSObject *p = JS_VALUE_GET_OBJ(sp[-2]);
+                    /* new field of a plain object (object literal) */
+                    if (likely(p->class_id == JS_CLASS_OBJECT && p->extensible &&
+                               !find_own_property1(p, atom))) {
+                        JSProperty *pr = add_property(ctx, p, atom, JS_PROP_C_W_E);
+                        if (unlikely(!pr)) {
+                            JS_FreeValue(ctx, sp[-1]);
+                            sp--;
+                            goto exception;
+                        }
+                        pr->u.value = sp[-1];
+                        sp--;
+                        BREAK;
+                    }
+                }
                 ret = JS_DefinePropertyValue(ctx, sp[-2], atom, sp[-1],
                                              JS_PROP_C_W_E | JS_PROP_THROW);
                 sp--;
