@@ -18794,6 +18794,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             break;
                         }
                     }
+                } else if (JS_VALUE_GET_TAG(obj) == JS_TAG_STRING) {
+                    val = js_int32(JS_VALUE_GET_STRING(obj)->len);
                 } else {
                 get_length_slow_path:
                     sf->cur_pc = pc;
