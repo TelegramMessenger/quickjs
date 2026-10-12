@@ -5284,6 +5284,8 @@ static int js_string_memcmp(JSString *p1, JSString *p2, int len)
 }
 
 static bool js_string_eq(JSString *p1, JSString *p2) {
+    if (p1 == p2)
+        return true;
     if (p1->len != p2->len)
         return false;
     return js_string_memcmp(p1, p2, p1->len) == 0;
@@ -5684,8 +5686,10 @@ static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2)
         goto ret_op1;
     }
     if (JS_REF_COUNT(p1) == 1 && p1->is_wide_char == p2->is_wide_char
+    &&  p1->atom_type == 0
     &&  js_malloc_usable_size(ctx, p1) >= sizeof(*p1) + ((p1->len + p2->len) << p2->is_wide_char) + 1 - p1->is_wide_char) {
         /* Concatenate in place in available space at the end of p1 */
+        p1->hash_next = 0; /* drop the cached hash (see js_string_map_hash) */
         if (p1->is_wide_char) {
             memcpy(str16(p1) + p1->len, str16(p2), p2->len << 1);
             p1->len += p2->len;
@@ -47534,9 +47538,14 @@ slow_path:
     return r;
 }
 
+/* return 0 if the 'len' characters at x1 in p1 and at x2 in p2 are equal */
 static int string_cmp(JSString *p1, JSString *p2, int x1, int x2, int len)
 {
     int i, c1, c2;
+    if (!p1->is_wide_char && !p2->is_wide_char)
+        return memcmp(str8(p1) + x1, str8(p2) + x2, len);
+    if (p1->is_wide_char && p2->is_wide_char)
+        return memcmp(str16(p1) + x1, str16(p2) + x2, len * 2);
     for (i = 0; i < len; i++) {
         if ((c1 = string_get(p1, x1 + i)) != (c2 = string_get(p2, x2 + i)))
             return c1 - c2;
@@ -47554,11 +47563,10 @@ static int string_indexof_char(JSString *p, int c, int from)
                 return i;
         }
     } else {
-        if ((c & ~0xff) == 0) {
-            for (i = from; i < len; i++) {
-                if (str8(p)[i] == (uint8_t)c)
-                    return i;
-            }
+        if ((c & ~0xff) == 0 && from < len) {
+            const uint8_t *q = memchr(str8(p) + from, c, len - from);
+            if (q)
+                return q - str8(p);
         }
     }
     return -1;
@@ -47712,7 +47720,10 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
         inc = 1;
     }
     ret = -1;
-    if (len >= v_len && inc * (stop - start) >= 0) {
+    if (inc > 0) {
+        if (len >= v_len && start <= stop)
+            ret = string_indexof(p, p1, start);
+    } else if (len >= v_len && inc * (stop - start) >= 0) {
         for (i = start;; i += inc) {
             if (!string_cmp(p, p1, i, 0, v_len)) {
                 ret = i;
@@ -47779,13 +47790,10 @@ static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
         start = stop = pos;
     }
     if (start >= 0 && start <= stop) {
-        for (i = start;; i++) {
-            if (!string_cmp(p, p1, i, 0, v_len)) {
-                ret = 1;
-                break;
-            }
-            if (i == stop)
-                break;
+        if (start < stop) {
+            ret = string_indexof(p, p1, start) >= 0;
+        } else {
+            ret = !string_cmp(p, p1, start, 0, v_len);
         }
     }
  done:
@@ -53718,6 +53726,23 @@ static JSValueConst map_normalize_key_const(JSContext *ctx, JSValueConst key)
     return safe_const(map_normalize_key(ctx, unsafe_unconst(key)));
 }
 
+/* Hash of a string Map/Set key: the atom hash, so that it is read from the
+   string when it is an atom and cached in the otherwise unused hash_next
+   field (with bit 31 set) when it is not. Strings are immutable once
+   shared and an in place atomization keeps the same value. */
+static uint32_t js_string_map_hash(JSString *p)
+{
+    uint32_t h;
+    if (p->atom_type == JS_ATOM_TYPE_STRING)
+        return p->hash;
+    if (p->atom_type == 0 && (p->hash_next & 0x80000000))
+        return p->hash_next & JS_ATOM_HASH_MASK;
+    h = hash_string(p, JS_ATOM_TYPE_STRING) & JS_ATOM_HASH_MASK;
+    if (p->atom_type == 0)
+        p->hash_next = h | 0x80000000;
+    return h;
+}
+
 /* XXX: better hash ? */
 static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
 {
@@ -53732,10 +53757,10 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
         h = JS_VALUE_GET_INT(key);
         break;
     case JS_TAG_STRING:
-        h = hash_string(JS_VALUE_GET_STRING(key), 0);
+        h = js_string_map_hash(JS_VALUE_GET_STRING(key));
         break;
     case JS_TAG_STRING_ROPE:
-        h = hash_string_rope(key, 0);
+        h = hash_string_rope(key, JS_ATOM_TYPE_STRING) & JS_ATOM_HASH_MASK;
         break;
     case JS_TAG_OBJECT:
     case JS_TAG_SYMBOL:
