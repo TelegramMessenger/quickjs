@@ -18439,6 +18439,38 @@ static inline bool js_put_fast_typed_array_element(JSObject *p, uint32_t idx,
     }
 }
 
+/* put_field of a property the object does not have yet: add it directly
+   when the object is a plain extensible object and the first object of its
+   prototype chain having the property, if any, has it as a writable data
+   property (a setter or a read-only property would apply instead). Return 1 if done (the value is taken), 0 to
+   take the generic path, -1 on exception (the value is not taken). */
+static no_inline int js_put_field_add(JSContext *ctx, JSObject *p, JSAtom atom,
+                                      JSValue val)
+{
+    JSObject *p1;
+    JSProperty *pr;
+
+    if (p->class_id != JS_CLASS_OBJECT || !p->extensible)
+        return 0;
+    for(p1 = p->shape->proto; p1 != NULL; p1 = p1->shape->proto) {
+        JSShapeProperty *prs;
+        if (p1->is_exotic)
+            return 0;
+        prs = find_own_property1(p1, atom);
+        if (prs) {
+            /* a writable data property of a prototype is shadowed */
+            if ((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) != JS_PROP_WRITABLE)
+                return 0;
+            break;
+        }
+    }
+    pr = add_property(ctx, p, atom, JS_PROP_C_W_E);
+    if (unlikely(!pr))
+        return -1;
+    pr->u.value = val;
+    return 1;
+}
+
 /* call from an opcode: C functions are called directly, which skips the
    frame setup of JS_CallInternal and the indirect class call */
 static inline JSValue js_call_interp(JSContext *ctx, JSValueConst func_obj,
@@ -20082,8 +20114,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
                     prs = find_own_property(&pr, p, atom);
-                    if (!prs)
-                        goto put_field_slow_path;
+                    if (!prs) {
+                        ret = js_put_field_add(ctx, p, atom, sp[-1]);
+                        if (ret == 0)
+                            goto put_field_slow_path;
+                        JS_FreeValue(ctx, obj);
+                        if (ret < 0) {
+                            JS_FreeValue(ctx, sp[-1]);
+                            sp -= 2;
+                            goto exception;
+                        }
+                        sp -= 2;
+                        BREAK;
+                    }
                     if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                               JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
                         /* fast path */
