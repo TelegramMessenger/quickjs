@@ -53424,7 +53424,15 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
         h = 0;
         break;
     }
-    return h ^ ctx->hash_seed ^ hash32(tag);
+    h = h ^ ctx->hash_seed ^ hash32(tag);
+    /* final avalanche: small integers (zero low double word) and aligned
+       pointers otherwise leave the low bits used by the bucket mask zero */
+    h ^= h >> 16;
+    h *= 0x7feb352d;
+    h ^= h >> 15;
+    h *= 0x846ca68b;
+    h ^= h >> 16;
+    return h;
 }
 
 static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s,
