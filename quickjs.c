@@ -2037,6 +2037,17 @@ static void *js_arena_malloc(JSRuntime *rt, size_t size)
     }
 }
 
+static void arena_release(JSRuntime *rt, JSArena *ar)
+{
+    list_del(&ar->link);
+    list_del(&ar->free_link);
+#ifdef JS_ARENA_SLABS
+    arena_slab_give_back(rt, ar);
+#else
+    rt->mf.js_free(rt->malloc_state.opaque, ar);
+#endif
+}
+
 static void js_arena_free(JSRuntime *rt, void *ptr)
 {
     JSMallocBlockHeader *b;
@@ -2065,13 +2076,28 @@ static void js_arena_free(JSRuntime *rt, void *ptr)
                      &rt->arena_state.free_arena_list[block_size_idx]);
         ar->n_used_blocks--;
         if (unlikely(ar->n_used_blocks == 0)) {
-            list_del(&ar->link);
-            list_del(&ar->free_link);
-#ifdef JS_ARENA_SLABS
-            arena_slab_give_back(rt, ar);
-#else
-            rt->mf.js_free(rt->malloc_state.opaque, ar);
-#endif
+            struct list_head *head = &rt->arena_state.free_arena_list[block_size_idx];
+            /* the only arena of its size class with free blocks is kept
+               until the next GC: a class whose live block count goes back
+               and forth across an arena boundary would otherwise map and
+               release the same arena on every cycle */
+            if (head->next == &ar->free_link && head->prev == &ar->free_link)
+                return;
+            arena_release(rt, ar);
+        }
+    }
+}
+
+/* release the empty arenas kept by js_arena_free */
+static void js_arena_trim(JSRuntime *rt)
+{
+    struct list_head *el, *el1;
+    int i;
+    for (i = 0; i < JS_ARENA_BLOCK_SIZE_COUNT; i++) {
+        list_for_each_safe(el, el1, &rt->arena_state.free_arena_list[i]) {
+            JSArena *ar = list_entry(el, JSArena, free_link);
+            if (ar->n_used_blocks == 0)
+                arena_release(rt, ar);
         }
     }
 }
@@ -7756,6 +7782,8 @@ void JS_RunGC(JSRuntime *rt)
 
     /* free the GC objects in a cycle */
     gc_free_cycles(rt);
+
+    js_arena_trim(rt);
 }
 
 /* Return false if not an object or if the object has already been
