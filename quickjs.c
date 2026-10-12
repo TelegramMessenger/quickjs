@@ -6130,6 +6130,32 @@ static void js_free_shape_null(JSRuntime *rt, JSShape *sh)
         js_free_shape(rt, sh);
 }
 
+#define JS_OBJECT_INLINE_PROP_MAX 16
+
+/* the property array allocated with the object, right after it */
+static inline JSProperty *js_object_inline_prop(JSObject *p)
+{
+    return (JSProperty *)(p + 1);
+}
+
+/* resize the property array of 'p' to 'new_size' entries. p->shape is
+   still the shape describing the current array. An array allocated with
+   the object is kept when it is large enough, and copied to a separate
+   allocation otherwise. */
+static JSProperty *js_realloc_object_prop(JSContext *ctx, JSObject *p,
+                                          uint32_t new_size)
+{
+    JSProperty *new_prop;
+    if (p->prop != js_object_inline_prop(p))
+        return js_realloc(ctx, p->prop, sizeof(JSProperty) * new_size);
+    if (new_size <= p->shape->prop_size)
+        return p->prop;
+    new_prop = js_malloc(ctx, sizeof(JSProperty) * new_size);
+    if (new_prop)
+        memcpy(new_prop, p->prop, sizeof(JSProperty) * p->shape->prop_count);
+    return new_prop;
+}
+
 /* make space to hold at least 'count' properties */
 static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
                                        JSObject *p, uint32_t count)
@@ -6146,7 +6172,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
        in case of memory allocation failure */
     if (p) {
         JSProperty *new_prop;
-        new_prop = js_realloc(ctx, p->prop, sizeof(new_prop[0]) * new_size);
+        new_prop = js_realloc_object_prop(ctx, p, new_size);
         if (unlikely(!new_prop))
             return -1;
         p->prop = new_prop;
@@ -6274,7 +6300,7 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     js_free(ctx, get_alloc_from_shape(old_sh));
 
     /* reduce the size of the object properties */
-    new_prop = js_realloc(ctx, p->prop, sizeof(new_prop[0]) * new_size);
+    new_prop = js_realloc_object_prop(ctx, p, new_size);
     if (new_prop)
         p->prop = new_prop;
     return 0;
@@ -6427,9 +6453,14 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
 {
     JSObject *p;
     int i;
+    bool inline_prop;
 
     js_trigger_gc(ctx->rt, sizeof(JSObject) + sizeof(JSProperty) * sh->prop_size);
-    p = js_malloc(ctx, sizeof(JSObject));
+    /* a small initial property array lives in the same block as the
+       object (see js_object_inline_prop()) */
+    inline_prop = sh->prop_size <= JS_OBJECT_INLINE_PROP_MAX;
+    p = js_malloc(ctx, sizeof(JSObject) +
+                  (inline_prop ? sizeof(JSProperty) * sh->prop_size : 0));
     if (unlikely(!p))
         goto fail;
     p->class_id = class_id;
@@ -6445,7 +6476,10 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->first_weak_ref = NULL;
     p->u.opaque = NULL;
     p->shape = sh;
-    p->prop = js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
+    if (inline_prop)
+        p->prop = js_object_inline_prop(p);
+    else
+        p->prop = js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
     if (unlikely(!p->prop)) {
         js_free(ctx, p);
     fail:
@@ -7352,7 +7386,8 @@ static void free_object(JSRuntime *rt, JSObject *p)
         free_property(rt, &p->prop[i], pr->flags);
         pr++;
     }
-    js_free_rt(rt, p->prop);
+    if (p->prop != js_object_inline_prop(p))
+        js_free_rt(rt, p->prop);
     /* as an optimization we destroy the shape immediately without
        putting it in gc_zero_ref_count_list */
     js_free_shape(rt, sh);
@@ -10475,8 +10510,7 @@ static JSProperty *add_property(JSContext *ctx,
             /*  the property array may need to be resized */
             if (new_sh->prop_size != sh->prop_size) {
                 JSProperty *new_prop;
-                new_prop = js_realloc(ctx, p->prop, sizeof(p->prop[0]) *
-                                      new_sh->prop_size);
+                new_prop = js_realloc_object_prop(ctx, p, new_sh->prop_size);
                 if (!new_prop)
                     return NULL;
                 p->prop = new_prop;
