@@ -284,7 +284,7 @@ typedef struct JSMallocState {
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <mach/vm_statistics.h>
-#define JS_ARENA_SLAB_TAG          VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1)
+#define JS_ARENA_SLAB_TAG          ((int)((unsigned)VM_MEMORY_APPLICATION_SPECIFIC_1 << 24))
 #define JS_ARENA_PAGE_RELEASE      MADV_FREE_REUSABLE
 #else
 #define JS_ARENA_SLAB_TAG          (-1)
