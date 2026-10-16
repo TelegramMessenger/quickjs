@@ -406,6 +406,12 @@ struct JSRuntime {
     uintptr_t stack_limit; /* lower stack limit */
 
     JSValue current_exception;
+    /* true while an uncatchable exception (interrupt, out of memory,
+       InternalError) unwinds the stack: nothing may catch it or turn it
+       into a value until the embedder takes it (see JS_GetException). It
+       lives here and not only on the error object because the exception
+       can be JS_NULL or be replaced on the way out. */
+    bool uncatchable_pending;
     /* true if inside an out of memory error, to avoid recursing */
     bool in_out_of_memory;
     /* true if inside build_backtrace, to avoid recursing */
@@ -2789,6 +2795,8 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
         JS_FreeValue(ctx, e->argv[i]);
     if (JS_IsException(res))
         ret = -1;
+    else if (unlikely(rt->uncatchable_pending) && JS_HasException(ctx))
+        ret = -1; /* the job dropped an uncatchable exception: report it */
     else
         ret = 1;
     JS_FreeValue(ctx, res);
@@ -8326,12 +8334,50 @@ JSValue JS_GetGlobalObject(JSContext *ctx)
     return js_dup(ctx->global_obj);
 }
 
+static void js_set_uncatchable_pending(JSRuntime *rt)
+{
+    struct list_head *el;
+
+    rt->uncatchable_pending = true;
+    /* the next interrupt poll in any context raises it again in case some
+       path turned it into a value or dropped it */
+    list_for_each(el, &rt->context_list) {
+        JSContext *c = list_entry(el, JSContext, link);
+        c->interrupt_counter = 1;
+    }
+}
+
+/* the embedder took the exception or made it catchable: the forced early
+   poll is not needed any more */
+static void js_clear_uncatchable_pending(JSRuntime *rt)
+{
+    struct list_head *el;
+
+    if (!rt->uncatchable_pending)
+        return;
+    rt->uncatchable_pending = false;
+    list_for_each(el, &rt->context_list) {
+        JSContext *c = list_entry(el, JSContext, link);
+        c->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;
+    }
+}
+
+/* true if the pending exception must reach the embedder: C code that got
+   JS_EXCEPTION back must return it, not convert it into a rejection, a
+   SuppressedError or a fallback value, and must not run more JS code. */
+static inline bool js_uncatchable_pending(JSContext *ctx)
+{
+    return ctx->rt->uncatchable_pending;
+}
+
 /* WARNING: obj is freed */
 JSValue JS_Throw(JSContext *ctx, JSValue obj)
 {
     JSRuntime *rt = ctx->rt;
     JS_FreeValue(ctx, rt->current_exception);
     rt->current_exception = obj;
+    if (unlikely(JS_IsUncatchableError(obj)))
+        js_set_uncatchable_pending(rt);
     return JS_EXCEPTION;
 }
 
@@ -8342,6 +8388,13 @@ JSValue JS_GetException(JSContext *ctx)
     JSRuntime *rt = ctx->rt;
     val = rt->current_exception;
     rt->current_exception = JS_UNINITIALIZED;
+    /* outside any JS frame the caller is the embedder: an uncatchable
+       exception has reached it. Inside a frame (a C function called from
+       JS) it stays uncatchable, see JS_ResetUncatchableError. Jobs run
+       without a frame too; the ones that may take an exception check the
+       state first. */
+    if (!rt->current_stack_frame)
+        js_clear_uncatchable_pending(rt);
     return val;
 }
 
@@ -8515,10 +8568,12 @@ static bool can_store_error_stack(JSValueConst obj)
 #define JS_BACKTRACE_FLAG_FILTER_FUNC      (1 << 2)
 
 /* if filename != NULL, an additional level is added with the filename
-   and line number information (used for parse error). */
-static void build_backtrace(JSContext *ctx, JSValueConst error_val,
-                            JSValueConst filter_func, const char *filename,
-                            int line_num, int col_num, int backtrace_flags)
+   and line number information (used for parse error). Return -1 if the JS
+   code it calls (Error.stackTraceLimit, Error.prepareStackTrace) raised an
+   uncatchable exception: that exception is left pending. */
+static int build_backtrace(JSContext *ctx, JSValueConst error_val,
+                           JSValueConst filter_func, const char *filename,
+                           int line_num, int col_num, int backtrace_flags)
 {
     JSStackFrame *sf, *sf_start;
     JSValue stack, prepare, saved_exception, error_obj;
@@ -8532,21 +8587,34 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     JSCallSiteData csd[64];
     uint32_t i;
     double d;
-    int stack_trace_limit;
+    int stack_trace_limit, ret = 0;
+    bool uncatchable, uncatchable_at_entry;
 
     rt = ctx->rt;
     if (rt->in_build_stack_trace)
-        return;
+        return 0;
     rt->in_build_stack_trace = true;
     error_obj = js_dup(error_val);
+    /* no JS code runs while an uncatchable exception unwinds: no valueOf()
+       of Error.stackTraceLimit, no Error.prepareStackTrace */
+    uncatchable_at_entry = uncatchable = js_uncatchable_pending(ctx);
 
-    // Save exception because conversion to double may fail.
-    saved_exception = JS_GetException(ctx);
+    /* The exception being decorated is set aside while the trace is built:
+       the JS code called here must not see it. It is put back at the end
+       unless an uncatchable exception (out of memory, interrupted in that
+       JS code) replaced it on the way. */
+    saved_exception = rt->current_exception;
+    rt->current_exception = JS_UNINITIALIZED;
 
     // Extract stack trace limit.
     // Ignore error since it sets d to NAN anyway.
-    // coverity[check_return]
-    JS_ToFloat64(ctx, &d, ctx->error_stack_trace_limit);
+    if (uncatchable && !JS_IsNumber(ctx->error_stack_trace_limit)) {
+        d = NAN;
+    } else if (JS_ToFloat64(ctx, &d, ctx->error_stack_trace_limit) < 0 &&
+               js_uncatchable_pending(ctx)) {
+        /* interrupted in valueOf(): no more JS code */
+        uncatchable = true;
+    }
     if (isnan(d) || d < 0.0)
         stack_trace_limit = 0;
     else if (d > INT32_MAX)
@@ -8554,23 +8622,18 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     else
         stack_trace_limit = fabs(d);
 
-    // Restore current exception.
-    JS_Throw(ctx, saved_exception);
-    saved_exception = JS_UNINITIALIZED;
-
     stack_trace_limit = min_int(stack_trace_limit, countof(csd));
     stack_trace_limit = max_int(stack_trace_limit, 0);
     has_prepare = false;
     has_filter_func = backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC;
     i = 0;
 
-    if (!JS_IsNull(ctx->error_ctor)) {
+    if (!JS_IsNull(ctx->error_ctor) && !uncatchable) {
         prepare = js_dup(ctx->error_prepare_stack);
         has_prepare = JS_IsFunction(ctx, prepare);
     }
 
     if (has_prepare) {
-        saved_exception = JS_GetException(ctx);
         if (stack_trace_limit == 0)
             goto done;
         if (filename)
@@ -8685,14 +8748,18 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             error_obj,
             stack,
         };
-        JSValue stack2 = JS_Call(ctx, prepare, ctx->error_ctor, countof(args), args);
+        JSValue stack2;
+        /* out of memory while building the call sites: no JS call */
+        if (js_uncatchable_pending(ctx))
+            stack2 = JS_EXCEPTION;
+        else
+            stack2 = JS_Call(ctx, prepare, ctx->error_ctor, countof(args), args);
         JS_FreeValue(ctx, stack);
         if (JS_IsException(stack2))
             stack = JS_NULL;
         else
             stack = stack2;
         JS_FreeValue(ctx, prepare);
-        JS_Throw(ctx, saved_exception);
     } else {
         if (dbuf_error(&dbuf))
             stack = JS_NULL;
@@ -8722,7 +8789,19 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     }
 
     JS_FreeValue(ctx, error_obj);
+    if (!uncatchable_at_entry && js_uncatchable_pending(ctx)) {
+        /* an uncatchable exception raised while building the trace (out of
+           memory, interrupted in Error.prepareStackTrace or in the valueOf
+           of Error.stackTraceLimit) replaces the one being decorated */
+        JS_FreeValue(ctx, saved_exception);
+        ret = -1;
+    } else {
+        /* put the decorated exception back; anything else thrown meanwhile
+           is dropped, as before */
+        JS_Throw(ctx, saved_exception);
+    }
     rt->in_build_stack_trace = false;
+    return ret;
 }
 
 JSValue JS_NewError(JSContext *ctx)
@@ -8730,7 +8809,10 @@ JSValue JS_NewError(JSContext *ctx)
     JSValue obj = JS_NewObjectClass(ctx, JS_CLASS_ERROR);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
-    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, 0);
+    if (build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, 0) < 0) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     return obj;
 }
 
@@ -8754,8 +8836,11 @@ static JSValue JS_MakeError2(JSContext *ctx, JSErrorEnum error_num,
         JS_DefinePropertyValue(ctx, obj, JS_ATOM_message, msg,
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     }
-    if (add_backtrace)
-        build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, 0);
+    if (add_backtrace &&
+        build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, 0) < 0) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     return obj;
 }
 
@@ -8778,6 +8863,10 @@ JS_ThrowError2(JSContext *ctx, JSErrorEnum error_num, bool add_backtrace,
 
     obj = JS_MakeError(ctx, error_num, add_backtrace, fmt, ap);
     if (unlikely(JS_IsException(obj))) {
+        /* keep the uncatchable exception that made it fail (out of memory,
+           interrupted in Error.prepareStackTrace) */
+        if (ctx->rt->uncatchable_pending && JS_HasException(ctx))
+            return JS_EXCEPTION;
         /* out of memory: throw JS_NULL to avoid recursing */
         obj = JS_NULL;
     }
@@ -8833,8 +8922,11 @@ JS_ThrowError(JSContext *ctx, JSErrorEnum error_num,
         va_start(ap, fmt);                                              \
         val = JS_ThrowError(ctx, JS_##uc##_ERROR, fmt, ap);             \
         va_end(ap);                                                     \
-        if (JS_##uc##_ERROR == JS_INTERNAL_ERROR)                       \
+        if (JS_##uc##_ERROR == JS_INTERNAL_ERROR) {                     \
+            /* uncatchable even if it is JS_NULL (out of memory) */      \
             js_set_uncatchable_error(ctx->rt->current_exception, true); \
+            js_set_uncatchable_pending(ctx->rt);                        \
+        }                                                               \
         return val;                                                     \
     }                                                                   \
 
@@ -8890,14 +8982,30 @@ static int JS_ThrowTypeErrorReadOnly(JSContext *ctx, int flags, JSAtom atom)
     }
 }
 
+/* Throw the InternalError of an interrupt or an out of memory. It is
+   uncatchable before it exists, so build_backtrace() runs no JS code for
+   it, and the memory limit is lifted while it is created: at the limit the
+   embedder gets an InternalError, not JS_NULL. */
+static void js_throw_uncatchable(JSContext *ctx, const char *msg)
+{
+    JSRuntime *rt = ctx->rt;
+    size_t limit = rt->malloc_state.malloc_limit;
+
+    js_set_uncatchable_pending(rt);
+    rt->malloc_state.malloc_limit = 0;
+    JS_ThrowInternalError(ctx, "%s", msg);
+    rt->malloc_state.malloc_limit = limit;
+}
+
 JSValue JS_ThrowOutOfMemory(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
     if (!rt->in_out_of_memory) {
         rt->in_out_of_memory = true;
-        JS_ThrowInternalError(ctx, "out of memory");
+        js_throw_uncatchable(ctx, "out of memory");
         rt->in_out_of_memory = false;
     }
+    js_set_uncatchable_pending(rt);
     return JS_EXCEPTION;
 }
 
@@ -8980,13 +9088,21 @@ static JSValue JS_ThrowTypeErrorInvalidClass(JSContext *ctx, int class_id)
 
 static void JS_ThrowInterrupted(JSContext *ctx)
 {
-    JS_ThrowInternalError(ctx, "interrupted");
-    JS_SetUncatchableError(ctx, ctx->rt->current_exception);
+    js_throw_uncatchable(ctx, "interrupted");
 }
 
 static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
+    if (unlikely(rt->uncatchable_pending)) {
+        /* JS code runs although an uncatchable exception has not reached
+           the embedder yet: some path dropped it or turned it into a
+           value. Raise it again, here and at every following poll. */
+        ctx->interrupt_counter = 1;
+        if (!JS_HasException(ctx))
+            JS_ThrowInterrupted(ctx);
+        return -1;
+    }
     ctx->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;
     if (rt->interrupt_handler) {
         if (rt->interrupt_handler(ctx, rt->interrupt_opaque)) {
@@ -11280,7 +11396,8 @@ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         case JS_CLASS_FLOAT64_ARRAY:
             if (JS_ToFloat64Free(ctx, &d, val)) {
             ta_cvt_fail:
-                if (flags & JS_PROP_REFLECT_DEFINE_PROPERTY) {
+                if ((flags & JS_PROP_REFLECT_DEFINE_PROPERTY) &&
+                    !js_uncatchable_pending(ctx)) {
                     JS_FreeValue(ctx, JS_GetException(ctx));
                     return false;
                 }
@@ -12423,16 +12540,23 @@ static void js_set_uncatchable_error(JSValueConst val, bool flag)
 void JS_SetUncatchableError(JSContext *ctx, JSValueConst val)
 {
     js_set_uncatchable_error(val, true);
+    if (JS_IsUncatchableError(val) &&
+        js_same_value(ctx, val, ctx->rt->current_exception))
+        js_set_uncatchable_pending(ctx->rt);
 }
 
 void JS_ClearUncatchableError(JSContext *ctx, JSValueConst val)
 {
     js_set_uncatchable_error(val, false);
+    /* the runtime state belongs to the pending exception only */
+    if (js_same_value(ctx, val, ctx->rt->current_exception))
+        js_clear_uncatchable_pending(ctx->rt);
 }
 
 void JS_ResetUncatchableError(JSContext *ctx)
 {
     js_set_uncatchable_error(ctx->rt->current_exception, false);
+    js_clear_uncatchable_pending(ctx->rt);
 }
 
 int JS_SetOpaque(JSValueConst obj, void *opaque)
@@ -17479,6 +17603,9 @@ static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
     int res;
 
     if (is_exception_pending) {
+        /* no return() call while an uncatchable exception unwinds */
+        if (js_uncatchable_pending(ctx))
+            return -1;
         ex_obj = ctx->rt->current_exception;
         ctx->rt->current_exception = JS_UNINITIALIZED;
         res = -1;
@@ -17506,7 +17633,12 @@ static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
     JS_FreeValue(ctx, ret);
  done:
     if (is_exception_pending) {
-        JS_Throw(ctx, ex_obj);
+        /* an uncatchable exception raised by return() wins over the
+           original one */
+        if (js_uncatchable_pending(ctx))
+            JS_FreeValue(ctx, ex_obj);
+        else
+            JS_Throw(ctx, ex_obj);
     }
     return res;
 }
@@ -19942,7 +20074,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sf->cur_pc = pc;
                 ret = JS_Call(ctx, method, val, 0, NULL);
                 if (JS_IsException(ret)) {
-                    JSValue new_error = JS_GetException(ctx);
+                    JSValue new_error;
+                    /* no SuppressedError and no other disposers */
+                    if (js_uncatchable_pending(ctx))
+                        goto exception;
+                    new_error = JS_GetException(ctx);
                     if (!JS_IsUninitialized(error_state)) {
                         JSValue se;
                         se = js_new_suppressed_error(ctx, new_error,
@@ -19950,6 +20086,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         JS_FreeValue(ctx, new_error);
                         JS_FreeValue(ctx, error_state);
                         if (JS_IsException(se)) {
+                            if (js_uncatchable_pending(ctx)) {
+                                sp[-1] = JS_UNDEFINED;
+                                goto exception;
+                            }
                             sp[-1] = JS_GetException(ctx);
                         } else {
                             sp[-1] = se;
@@ -20000,6 +20140,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, new_error);
                     JS_FreeValue(ctx, error_state);
                     if (JS_IsException(se)) {
+                        if (js_uncatchable_pending(ctx)) {
+                            sp[-1] = JS_UNDEFINED;
+                            goto exception;
+                        }
                         sp[-1] = JS_GetException(ctx);
                     } else {
                         sp[-1] = se;
@@ -21514,7 +21658,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
                         NULL, 0, 0, 0);
     }
-    if (!JS_IsUncatchableError(rt->current_exception)) {
+    if (!js_uncatchable_pending(ctx)) {
         while (sp > stack_buf) {
             JSValue val = *--sp;
             JS_FreeValue(ctx, val);
@@ -21525,6 +21669,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_FreeValue(ctx, sp[-1]); /* drop the next method */
                     sp--;
                     JS_IteratorClose(ctx, sp[-1], true);
+                    /* return() raised an uncatchable exception: no catch
+                       block of this frame gets it */
+                    if (unlikely(js_uncatchable_pending(ctx)))
+                        break;
                 } else {
                     *sp++ = rt->current_exception;
                     rt->current_exception = JS_UNINITIALIZED;
@@ -22095,7 +22243,7 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
     func_ret = async_func_resume(ctx, &s->func_state);
     if (JS_IsException(func_ret)) {
     fail:
-        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
+        if (unlikely(js_uncatchable_pending(ctx))) {
             is_success = false;
         } else {
             JSValue error = JS_GetException(ctx);
@@ -22104,7 +22252,7 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
             JS_FreeValue(ctx, error);
         resolved:
             if (unlikely(JS_IsException(ret2))) {
-                if (JS_IsUncatchableError(ctx->rt->current_exception)) {
+                if (js_uncatchable_pending(ctx)) {
                     is_success = false;
                 } else {
                     abort(); /* BUG */
@@ -22425,7 +22573,10 @@ static int js_async_generator_completed_return(JSContext *ctx,
     // A poisoned .constructor property is observable and the resulting
     // exception should be delivered to the catch handler.
     if (JS_IsException(promise)) {
-        JSValue err = JS_GetException(ctx);
+        JSValue err;
+        if (js_uncatchable_pending(ctx))
+            return -1;
+        err = JS_GetException(ctx);
         promise = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&err),
                                      /*is_reject*/1);
         JS_FreeValue(ctx, err);
@@ -22450,13 +22601,16 @@ static int js_async_generator_completed_return(JSContext *ctx,
     return res;
 }
 
-static void js_async_generator_resume_next(JSContext *ctx,
-                                           JSAsyncGeneratorData *s)
+/* return -1 if an uncatchable exception is pending */
+static int js_async_generator_resume_next(JSContext *ctx,
+                                          JSAsyncGeneratorData *s)
 {
     JSAsyncGeneratorRequest *next;
     JSValue func_ret, value;
 
     for(;;) {
+        if (js_uncatchable_pending(ctx))
+            return -1;
         if (list_empty(&s->queue))
             break;
         next = list_entry(s->queue.next, JSAsyncGeneratorRequest, link);
@@ -22504,6 +22658,10 @@ static void js_async_generator_resume_next(JSContext *ctx,
         resume_exec:
             func_ret = async_func_resume(ctx, &s->func_state);
             if (JS_IsException(func_ret)) {
+                if (js_uncatchable_pending(ctx)) {
+                    js_async_generator_complete(ctx, s);
+                    return -1;
+                }
                 value = JS_GetException(ctx);
                 js_async_generator_complete(ctx, s);
                 js_async_generator_reject(ctx, s, value);
@@ -22527,6 +22685,10 @@ static void js_async_generator_resume_next(JSContext *ctx,
                     ret = js_async_generator_await(ctx, s, value);
                     JS_FreeValue(ctx, value);
                     if (ret < 0) {
+                        if (js_uncatchable_pending(ctx)) {
+                            js_async_generator_complete(ctx, s);
+                            return -1;
+                        }
                         /* exception: throw it */
                         s->func_state.throw_flag = true;
                         goto resume_exec;
@@ -22549,7 +22711,8 @@ static void js_async_generator_resume_next(JSContext *ctx,
             abort();
         }
     }
- done: ;
+ done:
+    return js_uncatchable_pending(ctx) ? -1 : 0;
 }
 
 static JSValue js_async_generator_resolve_function(JSContext *ctx,
@@ -22573,6 +22736,8 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
         } else {
             js_async_generator_resolve(ctx, s, arg, true);
         }
+        if (js_uncatchable_pending(ctx))
+            return JS_EXCEPTION;
     } else if (s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING) {
         /* restart function execution after await() */
         s->func_state.throw_flag = is_reject;
@@ -22582,7 +22747,8 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
             /* return value of await */
             s->func_state.frame.cur_sp[-1] = js_dup(arg);
         }
-        js_async_generator_resume_next(ctx, s);
+        if (js_async_generator_resume_next(ctx, s) < 0)
+            return JS_EXCEPTION;
     }
     return JS_UNDEFINED;
 }
@@ -22602,6 +22768,8 @@ static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
     if (!s) {
         JSValue err, res2;
         JS_ThrowTypeError(ctx, "not an AsyncGenerator object");
+        if (js_uncatchable_pending(ctx))
+            goto fail;
         err = JS_GetException(ctx);
         res2 = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED,
                        1, vc(&err));
@@ -22621,7 +22789,10 @@ static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
     req->resolving_funcs[1] = resolving_funcs[1];
     list_add_tail(&req->link, &s->queue);
     if (s->state != JS_ASYNC_GENERATOR_STATE_EXECUTING) {
-        js_async_generator_resume_next(ctx, s);
+        if (js_async_generator_resume_next(ctx, s) < 0) {
+            JS_FreeValue(ctx, promise);
+            return JS_EXCEPTION;
+        }
     }
     return promise;
  fail:
@@ -32396,7 +32567,10 @@ static JSValue js_load_module_fulfilled(JSContext *ctx, JSValueConst this_val,
     /* return the module namespace */
     ns = JS_GetModuleNamespace(ctx, m);
     if (JS_IsException(ns)) {
-        JSValue err = JS_GetException(ctx);
+        JSValue err;
+        if (js_uncatchable_pending(ctx))
+            return JS_EXCEPTION;
+        err = JS_GetException(ctx);
         js_load_module_rejected(ctx, JS_UNDEFINED, 1, vc(&err), 0, func_data);
         return JS_UNDEFINED;
     }
@@ -32406,7 +32580,8 @@ static JSValue js_load_module_fulfilled(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
-static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
+/* return -1 if an uncatchable exception is left pending */
+static int JS_LoadModuleInternal(JSContext *ctx, const char *basename,
                                   const char *filename,
                                   JSValueConst *resolving_funcs,
                                   JSValueConst attributes)
@@ -32430,11 +32605,13 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
     evaluate_promise = JS_EvalFunction(ctx, func_obj);
     if (JS_IsException(evaluate_promise)) {
     fail:
+        if (js_uncatchable_pending(ctx))
+            return -1;
         err = JS_GetException(ctx);
         ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
         JS_FreeValue(ctx, ret); /* XXX: what to do if exception ? */
         JS_FreeValue(ctx, err);
-        return;
+        return 0;
     }
 
     func_obj = JS_NewModuleValue(ctx, m);
@@ -32449,6 +32626,7 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
     JS_FreeValue(ctx, evaluate_resolving_funcs[0]);
     JS_FreeValue(ctx, evaluate_resolving_funcs[1]);
     JS_FreeValue(ctx, evaluate_promise);
+    return js_uncatchable_pending(ctx) ? -1 : 0;
 }
 
 /* Return a promise or an exception in case of memory error. Used by
@@ -32461,7 +32639,11 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
     promise = JS_NewPromiseCapability(ctx, resolving_funcs);
     if (JS_IsException(promise))
         return JS_EXCEPTION;
-    JS_LoadModuleInternal(ctx, basename, filename, vc(resolving_funcs), JS_UNDEFINED);
+    if (JS_LoadModuleInternal(ctx, basename, filename, vc(resolving_funcs),
+                              JS_UNDEFINED) < 0) {
+        JS_FreeValue(ctx, promise);
+        promise = JS_EXCEPTION;
+    }
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
     return promise;
@@ -32489,11 +32671,18 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
     if (!filename)
         goto exception;
 
-    JS_LoadModuleInternal(ctx, basename, filename, resolving_funcs, attributes);
+    ret = JS_UNDEFINED;
+    if (JS_LoadModuleInternal(ctx, basename, filename, resolving_funcs,
+                              attributes) < 0)
+        ret = JS_EXCEPTION;
     JS_FreeCString(ctx, filename);
     JS_FreeCString(ctx, basename);
-    return JS_UNDEFINED;
+    return ret;
  exception:
+    if (js_uncatchable_pending(ctx)) {
+        JS_FreeCString(ctx, basename);
+        return JS_EXCEPTION;
+    }
     err = JS_GetException(ctx);
     ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
     JS_FreeValue(ctx, ret); /* XXX: what to do if exception ? */
@@ -32599,6 +32788,11 @@ done:
     return promise;
  exception:
     JS_FreeValue(ctx, attributes_obj);
+    if (js_uncatchable_pending(ctx)) {
+        JS_FreeValue(ctx, promise);
+        promise = JS_EXCEPTION;
+        goto done;
+    }
     err = JS_GetException(ctx);
     ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
     JS_FreeValue(ctx, ret);
@@ -32981,9 +33175,11 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
             m1->cycle_root = m; /* spec bug: should be present */
             stack_top = m1->stack_prev;
         }
-        JS_FreeValue(ctx, result);
         assert(m->status == JS_MODULE_STATUS_EVALUATED);
         assert(m->eval_has_exception);
+        if (js_uncatchable_pending(ctx) || JS_IsUncatchableError(result))
+            return JS_Throw(ctx, result);
+        JS_FreeValue(ctx, result);
         ret_val = JS_Call(ctx, m->resolving_funcs[1], JS_UNDEFINED,
                           1, vc(&m->eval_exception));
         JS_FreeValue(ctx, ret_val);
@@ -43433,7 +43629,9 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
     }
 
     /* skip the Error() function in the backtrace */
-    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
+    if (build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0,
+                        JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) < 0)
+        goto exception;
     return obj;
  exception:
     JS_FreeValue(ctx, obj);
@@ -43566,7 +43764,9 @@ static JSValue js_error_capture_stack_trace(JSContext *ctx, JSValueConst this_va
     JSValueConst v = argv[0];
     if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
         return JS_ThrowTypeErrorNotAnObject(ctx);
-    build_backtrace(ctx, v, argv[1], NULL, 0, 0, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL|JS_BACKTRACE_FLAG_FILTER_FUNC);
+    if (build_backtrace(ctx, v, argv[1], NULL, 0, 0,
+                        JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL|JS_BACKTRACE_FLAG_FILTER_FUNC) < 0)
+        return JS_EXCEPTION;
     return JS_UNDEFINED;
 }
 
@@ -46572,8 +46772,11 @@ static JSValue js_async_iterator_proto_dispose(JSContext *ctx,
 
     method = JS_GetProperty(ctx, this_val, JS_ATOM_return);
     if (JS_IsException(method)) {
-        JSValue exc = JS_GetException(ctx);
-        JSValue p = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&exc), 1);
+        JSValue exc, p;
+        if (js_uncatchable_pending(ctx))
+            return JS_EXCEPTION;
+        exc = JS_GetException(ctx);
+        p = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&exc), 1);
         JS_FreeValue(ctx, exc);
         return p;
     }
@@ -46583,8 +46786,11 @@ static JSValue js_async_iterator_proto_dispose(JSContext *ctx,
     ret = JS_Call(ctx, method, this_val, 0, NULL);
     JS_FreeValue(ctx, method);
     if (JS_IsException(ret)) {
-        JSValue exc = JS_GetException(ctx);
-        JSValue p = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&exc), 1);
+        JSValue exc, p;
+        if (js_uncatchable_pending(ctx))
+            return JS_EXCEPTION;
+        exc = JS_GetException(ctx);
+        p = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&exc), 1);
         JS_FreeValue(ctx, exc);
         return p;
     }
@@ -55578,8 +55784,11 @@ static JSValue js_new_suppressed_error(JSContext *ctx, JSValueConst error,
                            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     JS_DefinePropertyValue(ctx, obj, JS_ATOM_suppressed, js_dup(suppressed),
                            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0,
-                    JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
+    if (build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0,
+                        JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) < 0) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     return obj;
 }
 
@@ -55620,12 +55829,19 @@ static int js_dispose_resources(JSContext *ctx, JSDisposableStack *ds,
         res->value = JS_UNDEFINED;
         res->method = JS_UNDEFINED;
         if (JS_IsException(ret)) {
-            JSValue new_error = JS_GetException(ctx);
+            JSValue new_error;
+            if (js_uncatchable_pending(ctx))
+                goto uncatchable;
+            new_error = JS_GetException(ctx);
             if (has_error) {
                 JSValue suppressed = js_new_suppressed_error(ctx, new_error, error);
                 JS_FreeValue(ctx, new_error);
                 JS_FreeValue(ctx, error);
                 if (JS_IsException(suppressed)) {
+                    if (js_uncatchable_pending(ctx)) {
+                        has_error = false; /* error was freed above */
+                        goto uncatchable;
+                    }
                     error = JS_GetException(ctx);
                 } else {
                     error = suppressed;
@@ -55644,6 +55860,18 @@ static int js_dispose_resources(JSContext *ctx, JSDisposableStack *ds,
         return -1;
     }
     return 0;
+ uncatchable:
+    /* no SuppressedError and no further disposers: drop the rest */
+    if (has_error)
+        JS_FreeValue(ctx, error);
+    for (i--; i >= 0; i--) {
+        JS_FreeValue(ctx, ds->resources[i].value);
+        JS_FreeValue(ctx, ds->resources[i].method);
+        ds->resources[i].value = JS_UNDEFINED;
+        ds->resources[i].method = JS_UNDEFINED;
+    }
+    ds->resource_count = 0;
+    return -1;
 }
 
 static void js_disposable_stack_clear(JSRuntime *rt, JSDisposableStack *ds)
@@ -55933,7 +56161,10 @@ static JSValue js_async_dispose_step(JSContext *ctx, JSValueConst this_val,
     }
 
     if (JS_IsException(ret)) {
-        JSValue new_err = JS_GetException(ctx);
+        JSValue new_err;
+        if (js_uncatchable_pending(ctx))
+            return JS_EXCEPTION;
+        new_err = JS_GetException(ctx);
         if (has_prev_err) {
             JSValue se = js_new_suppressed_error(ctx, new_err, argv[0]);
             JS_FreeValue(ctx, new_err);
@@ -55981,7 +56212,8 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
 
     s = JS_GetOpaque2(ctx, this_val, class_id);
     if (!s) {
-        if (class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK) {
+        if (class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK &&
+            !js_uncatchable_pending(ctx)) {
             JSValue exc = JS_GetException(ctx);
             JSValue p = js_promise_resolve(ctx, ctx->promise_ctor, 1, vc(&exc),
                                            /*is_reject*/1);
@@ -56036,7 +56268,9 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
                     ret = JS_Call(ctx, res->method, res->value, 0, NULL);
                     break;
                 }
-                if (JS_IsException(ret)) {
+                if (JS_IsException(ret) && js_uncatchable_pending(ctx)) {
+                    chain = JS_EXCEPTION;
+                } else if (JS_IsException(ret)) {
                     JSValue err = JS_GetException(ctx);
                     chain = js_promise_resolve(ctx, ctx->promise_ctor, 1,
                                                vc(&err), /*is_reject*/1);
@@ -56326,7 +56560,7 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     }
     is_reject = JS_IsException(res);
     if (is_reject) {
-        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception)))
+        if (unlikely(js_uncatchable_pending(ctx)))
             return JS_EXCEPTION;
         res = JS_GetException(ctx);
     }
@@ -56427,7 +56661,7 @@ static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
         rt->promise_hook(ctx, JS_PROMISE_HOOK_AFTER, promise, JS_UNDEFINED,
                          rt->promise_hook_opaque);
     }
-    if (JS_IsException(res)) {
+    if (JS_IsException(res) && !js_uncatchable_pending(ctx)) {
         JSValue error = JS_GetException(ctx);
         res = JS_Call(ctx, args[1], JS_UNDEFINED, 1, vc(&error));
         JS_FreeValue(ctx, error);
@@ -56547,6 +56781,8 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
     if (JS_IsException(then)) {
         JSValue error;
     fail_reject:
+        if (js_uncatchable_pending(ctx))
+            return JS_EXCEPTION;
         error = JS_GetException(ctx);
         fulfill_or_reject_promise(ctx, s->promise, error, true);
         JS_FreeValue(ctx, error);
@@ -56658,6 +56894,8 @@ static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target,
     ret = JS_Call(ctx, executor, JS_UNDEFINED, 2, vc(args));
     if (JS_IsException(ret)) {
         JSValue ret2, error;
+        if (js_uncatchable_pending(ctx))
+            goto fail;
         error = JS_GetException(ctx);
         ret2 = JS_Call(ctx, args[1], JS_UNDEFINED, 1, vc(&error));
         JS_FreeValue(ctx, error);
@@ -56850,6 +57088,12 @@ static JSValue js_promise_try(JSContext *ctx, JSValueConst this_val,
         return result_promise;
     ret = JS_Call(ctx, argv[0], JS_UNDEFINED, argc - 1, argv + 1);
     if (JS_IsException(ret)) {
+        if (js_uncatchable_pending(ctx)) {
+            JS_FreeValue(ctx, resolving_funcs[0]);
+            JS_FreeValue(ctx, resolving_funcs[1]);
+            JS_FreeValue(ctx, result_promise);
+            return JS_EXCEPTION;
+        }
         is_reject = 1;
         ret = JS_GetException(ctx);
     }
@@ -56983,6 +57227,8 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
     if (JS_IsException(iter)) {
         JSValue error;
     fail_reject:
+        if (js_uncatchable_pending(ctx))
+            goto fail;
         error = JS_GetException(ctx);
         ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&error));
         JS_FreeValue(ctx, error);
@@ -57124,6 +57370,8 @@ static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
     if (JS_IsException(iter)) {
         JSValue error;
     fail_reject:
+        if (js_uncatchable_pending(ctx))
+            goto fail;
         error = JS_GetException(ctx);
         ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&error));
         JS_FreeValue(ctx, error);
@@ -57486,13 +57734,14 @@ static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst thi
                 err = js_create_iterator_result(ctx, js_dup(argv[0]), true);
                 is_reject = 0;
             } else if (JS_IteratorClose(ctx, s->sync_iter, false)) {
-                err = JS_GetException(ctx);
-                is_reject = 1;
+                goto reject;
             } else {
                 err = JS_MakeError2(ctx, JS_TYPE_ERROR, /*add_backtrace*/true,
                                     "throw is not a method");
                 is_reject = 1;
             }
+            if (JS_IsException(err))
+                goto reject;
             goto done_resolve;
         }
     }
@@ -57512,6 +57761,12 @@ static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst thi
     if (JS_IsException(value)) {
         JSValue res2;
     reject:
+        if (js_uncatchable_pending(ctx)) {
+            JS_FreeValue(ctx, resolving_funcs[0]);
+            JS_FreeValue(ctx, resolving_funcs[1]);
+            JS_FreeValue(ctx, promise);
+            return JS_EXCEPTION;
+        }
         err = JS_GetException(ctx);
         is_reject = 1;
     done_resolve:
@@ -64253,7 +64508,8 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
         csd->filename = JS_AtomToString(ctx, b->filename);
         if (JS_IsException(csd->filename)) {
             csd->filename = JS_NULL;
-            JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
+            if (!js_uncatchable_pending(ctx))
+                JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
         }
     } else {
         csd->native = true;
@@ -64275,7 +64531,8 @@ static void js_new_callsite_data2(JSContext *ctx, JSCallSiteData *csd, const cha
     csd->filename = JS_NewString(ctx, filename);
     if (JS_IsException(csd->filename)) {
         csd->filename = JS_NULL;
-        JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
+        if (!js_uncatchable_pending(ctx))
+            JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
     }
 }
 
@@ -64435,7 +64692,10 @@ static JSValue js_domexception_constructor0(JSContext *ctx, JSValueConst new_tar
     s->message = message;
     s->code = -1;
     JS_SetOpaqueInternal(obj, s);
-    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, backtrace_flags);
+    if (build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, backtrace_flags) < 0) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     return obj;
 fail3:
     JS_FreeValue(ctx, name);

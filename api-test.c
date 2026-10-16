@@ -2273,6 +2273,191 @@ static void json_stringify_oom(void)
     JS_FreeRuntime(rt);
 }
 
+/* The CPU budget of an embedder ran out: from now on the handler says stop
+   at every poll. */
+static int stop_interrupt_handler(JSContext *ctx, void *opaque)
+{
+    int *polls = (int *)opaque;
+    return ++*polls > 50;
+}
+
+/* The uncatchable exception raised by the interrupt handler must reach the
+   embedder through every construct that turns an exception into a value on
+   the way out: a Promise executor, Promise.try, an async generator, the
+   Promise.all/race iterator, a thenable getter, using and DisposableStack
+   disposers, an iterator return() during a throw, Error.prepareStackTrace
+   and Error.stackTraceLimit. Otherwise the script goes on and eval() returns
+   the trailing 1. Each construct runs at the top level and inside a job. */
+static void uncatchable_interrupt_sites(void)
+{
+    static const char *const sites[] = {
+        "try { for (;;) {} } catch (e) {}",
+        "try { for (;;) {} } finally {}",
+        "new Promise(() => { for (;;) {} })",
+        "Promise.try(() => { for (;;) {} })",
+        "(async function* () { for (;;) {} })().next()",
+        "Promise.all({ [Symbol.iterator]() { for (;;) {} } })",
+        "Promise.race({ [Symbol.iterator]() { for (;;) {} } })",
+        "Promise.resolve({ get then() { for (;;) {} } })",
+        "try { { using x = { [Symbol.dispose]() { for (;;) {} } };"
+        " throw new Error('body'); } } catch (e) {}",
+        "try { const s = new DisposableStack();"
+        " s.defer(() => { throw new Error('a'); });"
+        " s.defer(() => { for (;;) {} }); s.dispose(); } catch (e) {}",
+        "try { for (const x of { [Symbol.iterator]() { return {"
+        " next() { return { value: 1, done: false }; },"
+        " return() { for (;;) {} } }; } }) throw new Error('body'); }"
+        " catch (e) {}",
+        "try { Array.from({ [Symbol.iterator]() { return {"
+        " next() { return { value: 1, done: false }; },"
+        " return() { for (;;) {} } }; } }, () => { throw new Error('body'); });"
+        " } catch (e) {}",
+        "Error.prepareStackTrace = () => { for (;;) {} };"
+        " try { null.x; } catch (e) {}",
+        "Error.stackTraceLimit = { valueOf() { for (;;) {} } };"
+        " try { null.x; } catch (e) {}",
+    };
+    static const char *const modes[] = {
+        "%s; 1",
+        "Promise.resolve().then(() => { %s; }); 1",
+    };
+    char code[1024];
+    size_t i, j;
+
+    for (i = 0; i < sizeof(sites) / sizeof(sites[0]); i++) {
+        for (j = 0; j < sizeof(modes) / sizeof(modes[0]); j++) {
+            JSRuntime *rt = new_runtime();
+            JSContext *ctx = JS_NewContext(rt);
+            JSValue ret, e;
+            const char *str;
+            int polls = 0, r;
+
+            snprintf(code, sizeof(code), modes[j], sites[i]);
+            JS_SetInterruptHandler(rt, stop_interrupt_handler, &polls);
+            ret = eval(ctx, code);
+            if (j == 1) {
+                /* the construct runs in a job */
+                assert(!JS_IsException(ret));
+                JS_FreeValue(ctx, ret);
+                r = 1;
+                while (r > 0)
+                    r = JS_ExecutePendingJob(rt, &ctx);
+                assert(r == -1);
+            } else {
+                assert(JS_IsException(ret));
+            }
+            assert(polls > 50);
+            assert(JS_HasException(ctx));
+            e = JS_GetException(ctx);
+            assert(JS_IsError(e));
+            assert(JS_IsUncatchableError(e));
+            str = JS_ToCString(ctx, e);
+            assert(str != NULL);
+            assert(strstr(str, "InternalError: interrupted"));
+            JS_FreeCString(ctx, str);
+            JS_FreeValue(ctx, e);
+            /* the embedder took the exception: the runtime is usable again */
+            JS_SetInterruptHandler(rt, NULL, NULL);
+            ret = eval(ctx, "1 + 1");
+            assert(JS_VALUE_GET_TAG(ret) == JS_TAG_INT);
+            assert(JS_VALUE_GET_INT(ret) == 2);
+            JS_FreeValue(ctx, ret);
+            JS_FreeContext(ctx);
+            JS_FreeRuntime(rt);
+        }
+    }
+}
+
+/* At the memory limit the error object of the interrupt could not be
+   allocated and JS_NULL was thrown instead, which a plain catch block
+   catches. The embedder must get an uncatchable InternalError. */
+static void uncatchable_interrupt_at_memory_limit(void)
+{
+    static const char setup_code[] =
+        "globalThis.keep = [];"
+        " for (let i = 0; i < 64; i++) keep.push(new Uint8Array(16384));"
+        " globalThis.f = function() { try { for (;;) {} } catch (e) {} return 1; };";
+    JSValue global_object, func, ret, e;
+    JSMemoryUsage stats;
+    uint32_t headroom;
+    const char *str;
+
+    for (headroom = 0; headroom < 2048; headroom += 128) {
+        JSRuntime *rt = new_runtime();
+        JSContext *ctx = JS_NewContext(rt);
+        int polls = 0;
+
+        ret = eval(ctx, setup_code);
+        assert(!JS_IsException(ret));
+        JS_FreeValue(ctx, ret);
+        global_object = JS_GetGlobalObject(ctx);
+        func = JS_GetPropertyStr(ctx, global_object, "f");
+        assert(JS_IsFunction(ctx, func));
+        /* the function is compiled; only the call runs at the limit */
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, (size_t)stats.malloc_size + headroom);
+        JS_SetInterruptHandler(rt, stop_interrupt_handler, &polls);
+        ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);
+        assert(JS_IsException(ret));
+        assert(polls > 50);
+        e = JS_GetException(ctx);
+        assert(JS_IsError(e));
+        assert(JS_IsUncatchableError(e));
+        JS_SetMemoryLimit(rt, 0);
+        str = JS_ToCString(ctx, e);
+        assert(str != NULL);
+        assert(strstr(str, "InternalError: interrupted"));
+        JS_FreeCString(ctx, str);
+        JS_FreeValue(ctx, e);
+        JS_FreeValue(ctx, func);
+        JS_FreeValue(ctx, global_object);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+    }
+}
+
+/* Running out of memory is uncatchable too: no catch block runs, and the
+   embedder gets an InternalError object even when the error object itself
+   was the allocation that failed. The limits sweep the point at which the
+   allocation fails so that both the object and its property array hit it. */
+static void uncatchable_out_of_memory(void)
+{
+    static const char *const codes[] = {
+        "var caught = 0; try { const a = [];"
+        " for (;;) a.push({ a: 1, b: 2, c: 3 }); } catch (e) { caught = 1; }"
+        " caught",
+        "var caught = 0; try { const a = [];"
+        " for (;;) a.push(new Array(1000).fill(1)); } catch (e) { caught = 1; }"
+        " caught",
+    };
+    size_t i, limit;
+
+    for (i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
+        for (limit = 4000000; limit < 4000000 + 40 * 997; limit += 997) {
+            JSRuntime *rt = new_runtime();
+            JSContext *ctx;
+            JSValue ret, e;
+            const char *str;
+
+            JS_SetMemoryLimit(rt, limit);
+            ctx = JS_NewContext(rt);
+            ret = eval(ctx, codes[i]);
+            assert(JS_IsException(ret));
+            e = JS_GetException(ctx);
+            assert(JS_IsError(e));
+            assert(JS_IsUncatchableError(e));
+            JS_SetMemoryLimit(rt, 0);
+            str = JS_ToCString(ctx, e);
+            assert(str != NULL);
+            assert(strstr(str, "InternalError: out of memory"));
+            JS_FreeCString(ctx, str);
+            JS_FreeValue(ctx, e);
+            JS_FreeContext(ctx);
+            JS_FreeRuntime(rt);
+        }
+    }
+}
+
 int main(void)
 {
     cfunctions();
@@ -2313,6 +2498,9 @@ int main(void)
     add_intrinsic_bigint();
     new_typed_array();
     std_eval_interrupt_handler();
+    uncatchable_interrupt_sites();
+    uncatchable_interrupt_at_memory_limit();
+    uncatchable_out_of_memory();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();

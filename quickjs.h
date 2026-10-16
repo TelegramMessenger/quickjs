@@ -843,7 +843,14 @@ JS_EXTERN bool JS_IsError(JSValueConst val);
 JS_EXTERN bool JS_IsUncatchableError(JSValueConst val);
 JS_EXTERN void JS_SetUncatchableError(JSContext *ctx, JSValueConst val);
 JS_EXTERN void JS_ClearUncatchableError(JSContext *ctx, JSValueConst val);
-// Shorthand for:
+// An uncatchable exception (the interrupt handler returned non-zero, out of
+// memory, any InternalError) is also a runtime state: until the embedder
+// takes it with JS_GetException() outside of any JS call, no catch block,
+// Promise executor, thenable, async generator, disposer, iterator return()
+// or Error.prepareStackTrace can observe it or turn it into a value, and
+// every interrupt poll raises it again. The state is also cleared by the
+// next JS call made from outside the engine and by this function, which
+// in addition makes the pending exception object catchable:
 //  JSValue exc = JS_GetException(ctx);
 //  JS_ClearUncatchableError(ctx, exc);
 //  JS_Throw(ctx, exc);
