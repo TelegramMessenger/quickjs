@@ -1075,6 +1075,9 @@ static void large_allocation_accounting(void)
     rt = new_runtime();
     ctx = JS_NewContext(rt);
 
+    /* the shapes JS_NewContext leaves behind are freed by the first GC inside
+       eval(); collect them first so that the delta is the block alone */
+    JS_RunGC(rt);
     JS_ComputeMemoryUsage(rt, &before);
     ret = eval(ctx, "globalThis.a = new Uint8Array(1024 * 1024)");
     assert(!JS_IsException(ret));
