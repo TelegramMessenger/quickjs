@@ -44828,6 +44828,7 @@ static JSValue js_array_find(JSContext *ctx, JSValueConst this_val,
             }
         }
         JS_FreeValue(ctx, val);
+        val = JS_UNDEFINED;
         JS_FreeValue(ctx, index_val);
     }
     JS_FreeValue(ctx, obj);
