@@ -2461,6 +2461,95 @@ static void uncatchable_out_of_memory(void)
     }
 }
 
+/* A push_scope() allocation failure must fail the whole compilation cleanly.
+   push_scope() returns -1 when the parser cannot grow fd->scopes; every caller
+   has to propagate that, otherwise scope_level walks negative and a later
+   fd->scopes[scope_level] access becomes an out-of-bounds read/write. We compile
+   a scope-heavy program under a sweep of memory ceilings so that some ceiling
+   lands inside the parser's scope allocations, and assert the parser either
+   compiles it or reports a clean error object, never crashing. The out-of-bounds
+   access itself is caught by ASan (the suite's CI configuration): on a fixed
+   engine the sweep stays clean, on a regressed one the scopes[] underflow is a
+   heap-buffer-overflow. This asserts clean failure; it does not try to observe a
+   corruption.
+
+   Note: this uses a plain JS_NewRuntime() rather than new_runtime(), i.e. it does
+   not enable JS_ABORT_ON_LEAKS. QuickJS's parser has a separate, pre-existing
+   atom-cleanup gap on the compile-time OOM path (the identifier atoms of block-
+   and catch-scoped variables are not all freed when a parse aborts for OOM); that
+   is a benign leak, orthogonal to the memory corruption guarded here, and would
+   otherwise mask this test. */
+static void parser_scope_out_of_memory(void)
+{
+    static char src[1 << 16];
+    size_t len = 0;
+    int unit;
+    uint32_t headroom;
+
+    /* A breadth of scope-pushing constructs: block, if, for, for-of, switch,
+       try/catch, with, function body, class body / private-field / method /
+       static-init scopes, and a derived class whose default constructor is
+       synthesized at parse time. Sequential units also grow the top-level
+       function's scope array, so a ceiling in the sweep lands on a push_scope()
+       reallocation. Nesting stays shallow so the only failure under the ceiling
+       is out of memory, never a stack overflow. */
+    for (unit = 0; unit < 48; unit++) {
+        int n = snprintf(src + len, sizeof(src) - len,
+            "{let a=0;if(a){let b=1;}for(let i=0;i<1;i++){let c=i;}"
+            "for(const z of[0]){let q=z;}try{let d=2;}catch(e){let f=3;}"
+            "switch(a){case 0:{let g=4;}}with({}){let w=0;}}\n"
+            "function fn%d(){let h=0;{let k=1;}return h;}\n"
+            "class C%d{#p=0;m(){let x=0;}static{let y=1;}}\n"
+            "class D%d extends C%d{}\n",
+            unit, unit, unit, unit);
+        assert(n > 0 && (size_t)n < sizeof(src) - len);
+        len += (size_t)n;
+    }
+
+    /* Given enough memory the program must compile: proves the sweep is not
+       vacuously failing on an invalid source. */
+    {
+        JSRuntime *rt = JS_NewRuntime();
+        JSContext *ctx = JS_NewContext(rt);
+        JSValue ret = JS_Eval(ctx, src, len, "<scope>",
+                              JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        assert(!JS_IsException(ret));
+        JS_FreeValue(ctx, ret);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+    }
+
+    /* Sweep the ceiling from "fails on an early parser allocation" up to
+       "compiles fully". Every outcome must be clean. */
+    for (headroom = 0; headroom < 4u * 1024 * 1024; headroom += 48 * 1024) {
+        JSRuntime *rt = JS_NewRuntime();
+        JSContext *ctx = JS_NewContext(rt);
+        JSMemoryUsage stats;
+        JSValue ret;
+
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, (size_t)stats.malloc_size + headroom);
+        ret = JS_Eval(ctx, src, len, "<scope>",
+                      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (JS_IsException(ret)) {
+            JSValue e = JS_GetException(ctx);
+            const char *str;
+            assert(JS_IsError(e));        /* a real error object, not corruption */
+            JS_SetMemoryLimit(rt, 0);     /* lift so stringifying can allocate */
+            str = JS_ToCString(ctx, e);
+            assert(str != NULL);
+            assert(strstr(str, "out of memory") != NULL);
+            JS_FreeCString(ctx, str);
+            JS_FreeValue(ctx, e);
+        } else {
+            JS_SetMemoryLimit(rt, 0);
+        }
+        JS_FreeValue(ctx, ret);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);               /* ABORT_ON_LEAKS catches corruption */
+    }
+}
+
 int main(void)
 {
     cfunctions();
@@ -2504,6 +2593,7 @@ int main(void)
     uncatchable_interrupt_sites();
     uncatchable_interrupt_at_memory_limit();
     uncatchable_out_of_memory();
+    parser_scope_out_of_memory();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();
