@@ -25173,6 +25173,12 @@ static void pop_scope(JSParseState *s) {
         /* disable scoped variables */
         JSFunctionDef *fd = s->cur_func;
         int scope = fd->scope_level;
+        /* Defense in depth: a negative scope_level would make the
+           fd->scopes[scope] read below go out of bounds (see add_scope_var).
+           It can only be reached if a push_scope() failure went
+           unpropagated. */
+        if (scope < 0)
+            return;
         emit_op(s, OP_leave_scope);
         emit_u16(s, scope);
         fd->scope_level = fd->scopes[scope].parent;
@@ -25216,7 +25222,14 @@ static int add_var(JSContext *ctx, JSFunctionDef *fd, JSAtom name)
 static int add_scope_var(JSContext *ctx, JSFunctionDef *fd, JSAtom name,
                          JSVarKindEnum var_kind)
 {
-    int idx = add_var(ctx, fd, name);
+    int idx;
+    /* Defense in depth: a negative scope_level would turn the
+       fd->scopes[fd->scope_level] write below into an out-of-bounds access.
+       It can only be reached if a push_scope() allocation failure went
+       unpropagated; refuse rather than corrupt memory. */
+    if (fd->scope_level < 0)
+        return -1;
+    idx = add_var(ctx, fd, name);
     if (idx >= 0) {
         JSVarDef *vd = &fd->vars[idx];
         vd->var_kind = var_kind;
