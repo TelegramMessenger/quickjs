@@ -2550,6 +2550,86 @@ static void parser_scope_out_of_memory(void)
     }
 }
 
+/* The sibling of parser_scope_out_of_memory for the label array. new_label()
+   returns -1 when the parser cannot grow fd->label_slots; the for-in/of and
+   C-style for headers and js_parse_destructuring_element use the returned
+   label as an array index (a relocation loop from label_cont, or
+   label_slots[label_parse]) before the poisoned-bytecode error is noticed, so
+   an ignored -1 becomes an out-of-bounds access at label_slots[-1]. This is a
+   distinct array from the scopes[] underflow above and is not covered by the
+   scope_level<0 backstop. A label-heavy program under the same ceiling sweep
+   lands a ceiling on a new_label() reallocation; ASan catches the underflow on
+   a regressed engine, and the parser must otherwise report a clean error.
+   Plain JS_NewRuntime() for the same pre-existing-atom-leak reason noted above. */
+static void parser_label_out_of_memory(void)
+{
+    static char src[1 << 16];
+    size_t len = 0;
+    int unit;
+    uint32_t headroom;
+
+    /* Each unit mints labels in the three headers that index by a new_label()
+       result: a for-of (js_parse_for_in_of), a C-style for, and an array
+       destructuring target (js_parse_destructuring_element). Sequential units
+       grow label_slots so a ceiling in the sweep lands on a new_label(). */
+    while (len + 128 < sizeof(src)) {
+        int n = snprintf(src + len, sizeof(src) - len,
+            "for(const z%d of[0]){let q=z%d;}"
+            "for(let i%d=0;i%d<1;i%d++){let c=i%d;}"
+            "let[a%d,b%d]=[0,1];\n",
+            unit, unit, unit, unit, unit, unit, unit, unit);
+        if (n <= 0 || (size_t)n >= sizeof(src) - len)
+            break;
+        len += (size_t)n;
+        unit++;
+    }
+
+    {
+        JSRuntime *rt = JS_NewRuntime();
+        JSContext *ctx = JS_NewContext(rt);
+        JSValue ret = JS_Eval(ctx, src, len, "<label>",
+                              JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        assert(!JS_IsException(ret));
+        JS_FreeValue(ctx, ret);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+    }
+
+    int oom_seen = 0;
+    for (headroom = 0; headroom < 4u * 1024 * 1024; headroom += 48 * 1024) {
+        JSRuntime *rt = JS_NewRuntime();
+        JSContext *ctx = JS_NewContext(rt);
+        JSMemoryUsage stats;
+        JSValue ret;
+
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, (size_t)stats.malloc_size + headroom);
+        ret = JS_Eval(ctx, src, len, "<label>",
+                      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (JS_IsException(ret)) {
+            JSValue e = JS_GetException(ctx);
+            const char *str;
+            /* The parse must fail cleanly, never with a wild access (ASan
+               guards that). Under a ceiling a failed label allocation surfaces
+               as out of memory, or, when it poisons parsing first, as a plain
+               SyntaxError or an uninitialized completion value; all are clean. */
+            JS_SetMemoryLimit(rt, 0);
+            str = JS_ToCString(ctx, e);
+            if (str != NULL && strstr(str, "out of memory") != NULL)
+                oom_seen = 1;
+            JS_FreeCString(ctx, str);
+            JS_FreeValue(ctx, e);
+        } else {
+            JS_SetMemoryLimit(rt, 0);
+        }
+        JS_FreeValue(ctx, ret);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+    }
+    /* The sweep must have reached the memory limit mid-parse at least once. */
+    assert(oom_seen);
+}
+
 int main(void)
 {
     cfunctions();
@@ -2594,6 +2674,7 @@ int main(void)
     uncatchable_interrupt_at_memory_limit();
     uncatchable_out_of_memory();
     parser_scope_out_of_memory();
+    parser_label_out_of_memory();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();

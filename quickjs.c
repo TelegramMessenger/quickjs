@@ -27405,6 +27405,8 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
 
     label_parse = new_label(s);
     label_assign = new_label(s);
+    if (label_parse < 0 || label_assign < 0)
+        return -1;
 
     start_addr = s->cur_func->byte_code.size;
     if (hasval) {
@@ -29831,6 +29833,8 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     label_body = new_label(s);
     label_break = new_label(s);
     label_next = new_label(s);
+    if (label_cont < 0 || label_body < 0 || label_break < 0 || label_next < 0)
+        return -1;
 
     /* create scope for the lexical variables declared in the enumeration
        expressions. XXX: Not completely correct because of weird capturing
@@ -30500,6 +30504,9 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             label_cont = new_label(s);
             label_body = new_label(s);
             label_break = new_label(s);
+            if (label_test < 0 || label_cont < 0 || label_body < 0
+                || label_break < 0)
+                goto fail;
 
             push_break_entry(s->cur_func, &break_entry,
                              label_name, label_break, label_cont, 0);
