@@ -35576,6 +35576,18 @@ static __exception int add_closure_variables(JSContext *ctx, JSFunctionDef *s,
         cv->var_idx = i;
         cv->var_name = JS_DupAtom(ctx, cv0->var_name);
     }
+    /* Direct eval combines the caller's arguments, locals and inherited
+       closure variables into one environment. Each set is individually
+       bounded, but their sum can exceed the 16-bit closure_var_count field,
+       truncating it so js_closure2() under-allocates the var_ref array while
+       the eval bytecode still indexes the full environment. A count of
+       JS_MAX_LOCAL_VARS still fits (its highest index is JS_MAX_LOCAL_VARS-1),
+       matching what add_closure_var() permits; reject only a larger total. */
+    if (s->closure_var_count > JS_MAX_LOCAL_VARS) {
+        JS_ThrowSyntaxError(ctx, "too many closure variables used (only %d allowed)",
+                            JS_MAX_LOCAL_VARS);
+        return -1;
+    }
     return 0;
 }
 
@@ -37891,6 +37903,24 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 
     if (resolve_labels(ctx, fd))
         goto fail;
+
+    /* resolve_variables() and resolve_labels() capture local variables into
+       the per-frame var_ref array; in particular resolve_labels() captures
+       every parameter when the function needs a mapped arguments object. The
+       argument and local counts are each individually bounded below
+       JS_MAX_LOCAL_VARS, but a mapped arguments object (which captures all
+       arguments) combined with an independently captured local can push the
+       total one past the limit, overflowing the 16-bit
+       JSFunctionBytecode.var_ref_count field. The field then truncates so
+       JS_CallInternal() under-allocates the sf->var_refs array while the
+       bytecode keeps indexing the full set -- get_var_ref() then reads past
+       the allocation. A count of JS_MAX_LOCAL_VARS still fits (its highest
+       index is JS_MAX_LOCAL_VARS-1); reject only a larger total. */
+    if (fd->var_ref_count > JS_MAX_LOCAL_VARS) {
+        JS_ThrowSyntaxError(ctx, "too many captured variables (only %d allowed)",
+                            JS_MAX_LOCAL_VARS);
+        goto fail;
+    }
 
     if (compute_stack_size(ctx, fd, &stack_size) < 0)
         goto fail;
@@ -54671,14 +54701,22 @@ static JSValue js_map_clear(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv, int magic)
 {
     JSMapState *s = JS_GetOpaque2(ctx, this_val, JS_CLASS_MAP + magic);
-    struct list_head *el, *el1;
+    struct list_head *el;
     JSMapRecord *mr;
 
     if (!s)
         return JS_EXCEPTION;
-    list_for_each_safe(el, el1, &s->records) {
+    /* Deleting a record frees its value, which may run a finalizer (e.g. a
+       map iterator stored as a value) that frees other records, including
+       the next one. Lock the current record and read the next link only
+       after the deletion, like js_map_forEach, instead of caching it. */
+    el = s->records.next;
+    while (el != &s->records) {
         mr = list_entry(el, JSMapRecord, link);
+        mr->ref_count++;
         map_delete_record(ctx->rt, s, mr);
+        el = el->next;
+        map_decref_record(ctx->rt, mr);
     }
     return JS_UNDEFINED;
 }
@@ -64316,19 +64354,29 @@ static JSValue js_finrec_unregister(JSContext *ctx, JSValueConst this_val, int a
     if (!is_valid_weakref_target(token))
         return JS_ThrowTypeError(ctx, "invalid unregister token");
 
-    struct list_head *el, *el1;
-    bool removed = false;
+    struct list_head *el, *el1, removed;
+    JSFinRecEntry *fre;
+    init_list_head(&removed);
+    /* first pass to unlink the matching entries and their weak refs:
+       freeing a held value can finalize the target of another entry,
+       and reset_weak_ref() would then free entries we have yet to visit */
     list_for_each_safe(el, el1, &frd->entries) {
-        JSFinRecEntry *fre = list_entry(el, JSFinRecEntry, link);
+        fre = list_entry(el, JSFinRecEntry, link);
         if (js_same_value(ctx, fre->token, token)) {
             list_del(&fre->link);
             delete_finrec_weakref(ctx->rt, fre);
-            js_finrec_free(ctx->rt, fre);
-            removed = true;
+            list_add_tail(&fre->link, &removed);
         }
     }
+    bool found = !list_empty(&removed);
+    /* second pass to actually free the entries */
+    while (!list_empty(&removed)) {
+        fre = list_entry(removed.next, JSFinRecEntry, link);
+        list_del(&fre->link);
+        js_finrec_free(ctx->rt, fre);
+    }
 
-    return js_bool(removed);
+    return js_bool(found);
 }
 
 static const JSCFunctionListEntry js_finrec_proto_funcs[] = {
@@ -64409,6 +64457,12 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
         case JS_WEAK_REF_KIND_WEAK_REF:
             wrd = wr->u.weak_ref_data;
             wrd->target = JS_UNDEFINED;
+            /* Detach the WeakRef object now: the second pass can drop its
+               last reference (it may be a WeakMap value or a held value
+               for this same target, freed synchronously when the target is
+               a symbol), and its finalizer must then find the sentinel, not
+               a cleared target and a record still in this list. */
+            JS_SetOpaqueInternal(wrd->obj, &js_weakref_sentinel);
             break;
         case JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY:
             fre = wr->u.fin_rec_entry;
@@ -64430,9 +64484,8 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
             js_free_rt(rt, mr);
             break;
         case JS_WEAK_REF_KIND_WEAK_REF:
-            wrd = wr->u.weak_ref_data;
-            JS_SetOpaqueInternal(wrd->obj, &js_weakref_sentinel);
-            js_free_rt(rt, wrd);
+            /* the WeakRef object may already be freed, do not touch it */
+            js_free_rt(rt, wr->u.weak_ref_data);
             break;
         case JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY: {
             fre = wr->u.fin_rec_entry;
