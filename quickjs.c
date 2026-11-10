@@ -64410,6 +64410,12 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
         case JS_WEAK_REF_KIND_WEAK_REF:
             wrd = wr->u.weak_ref_data;
             wrd->target = JS_UNDEFINED;
+            /* Detach the WeakRef object now: the second pass can drop its
+               last reference (it may be a WeakMap value or a held value
+               for this same target, freed synchronously when the target is
+               a symbol), and its finalizer must then find the sentinel, not
+               a cleared target and a record still in this list. */
+            JS_SetOpaqueInternal(wrd->obj, &js_weakref_sentinel);
             break;
         case JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY:
             fre = wr->u.fin_rec_entry;
@@ -64431,9 +64437,8 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
             js_free_rt(rt, mr);
             break;
         case JS_WEAK_REF_KIND_WEAK_REF:
-            wrd = wr->u.weak_ref_data;
-            JS_SetOpaqueInternal(wrd->obj, &js_weakref_sentinel);
-            js_free_rt(rt, wrd);
+            /* the WeakRef object may already be freed, do not touch it */
+            js_free_rt(rt, wr->u.weak_ref_data);
             break;
         case JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY: {
             fre = wr->u.fin_rec_entry;
