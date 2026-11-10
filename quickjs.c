@@ -35559,6 +35559,18 @@ static __exception int add_closure_variables(JSContext *ctx, JSFunctionDef *s,
         cv->var_idx = i;
         cv->var_name = JS_DupAtom(ctx, cv0->var_name);
     }
+    /* Direct eval combines the caller's arguments, locals and inherited
+       closure variables into one environment. Each set is individually
+       bounded, but their sum can exceed the 16-bit closure_var_count field,
+       truncating it so js_closure2() under-allocates the var_ref array while
+       the eval bytecode still indexes the full environment. A count of
+       JS_MAX_LOCAL_VARS still fits (its highest index is JS_MAX_LOCAL_VARS-1),
+       matching what add_closure_var() permits; reject only a larger total. */
+    if (s->closure_var_count > JS_MAX_LOCAL_VARS) {
+        JS_ThrowSyntaxError(ctx, "too many closure variables used (only %d allowed)",
+                            JS_MAX_LOCAL_VARS);
+        return -1;
+    }
     return 0;
 }
 
