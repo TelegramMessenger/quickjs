@@ -37887,6 +37887,24 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     if (resolve_labels(ctx, fd))
         goto fail;
 
+    /* resolve_variables() and resolve_labels() capture local variables into
+       the per-frame var_ref array; in particular resolve_labels() captures
+       every parameter when the function needs a mapped arguments object. The
+       argument and local counts are each individually bounded below
+       JS_MAX_LOCAL_VARS, but a mapped arguments object (which captures all
+       arguments) combined with an independently captured local can push the
+       total one past the limit, overflowing the 16-bit
+       JSFunctionBytecode.var_ref_count field. The field then truncates so
+       JS_CallInternal() under-allocates the sf->var_refs array while the
+       bytecode keeps indexing the full set -- get_var_ref() then reads past
+       the allocation. A count of JS_MAX_LOCAL_VARS still fits (its highest
+       index is JS_MAX_LOCAL_VARS-1); reject only a larger total. */
+    if (fd->var_ref_count > JS_MAX_LOCAL_VARS) {
+        JS_ThrowSyntaxError(ctx, "too many captured variables (only %d allowed)",
+                            JS_MAX_LOCAL_VARS);
+        goto fail;
+    }
+
     if (compute_stack_size(ctx, fd, &stack_size) < 0)
         goto fail;
 
