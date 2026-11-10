@@ -54654,14 +54654,22 @@ static JSValue js_map_clear(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv, int magic)
 {
     JSMapState *s = JS_GetOpaque2(ctx, this_val, JS_CLASS_MAP + magic);
-    struct list_head *el, *el1;
+    struct list_head *el;
     JSMapRecord *mr;
 
     if (!s)
         return JS_EXCEPTION;
-    list_for_each_safe(el, el1, &s->records) {
+    /* Deleting a record frees its value, which may run a finalizer (e.g. a
+       map iterator stored as a value) that frees other records, including
+       the next one. Lock the current record and read the next link only
+       after the deletion, like js_map_forEach, instead of caching it. */
+    el = s->records.next;
+    while (el != &s->records) {
         mr = list_entry(el, JSMapRecord, link);
+        mr->ref_count++;
         map_delete_record(ctx->rt, s, mr);
+        el = el->next;
+        map_decref_record(ctx->rt, mr);
     }
     return JS_UNDEFINED;
 }
