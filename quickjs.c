@@ -21588,17 +21588,28 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_await):
             ret_val = js_int32(FUNC_RET_AWAIT);
-            goto done_generator;
+            goto generator_exit;
         CASE(OP_yield):
             ret_val = js_int32(FUNC_RET_YIELD);
-            goto done_generator;
+            goto generator_exit;
         CASE(OP_yield_star):
         CASE(OP_async_yield_star):
             ret_val = js_int32(FUNC_RET_YIELD_STAR);
-            goto done_generator;
+            goto generator_exit;
         CASE(OP_return_async):
         CASE(OP_initial_yield):
             ret_val = JS_UNDEFINED;
+        generator_exit:
+            /* These opcodes suspend the frame, which only a generator or an
+               async function can do: their frame outlives the call. A normal
+               function's frame is on the C stack, and leaving it through
+               done_generator would skip close_var_refs(), so closures would
+               keep references into a frame that no longer exists. The parser
+               never emits them there; refuse it if bytecode ever does. */
+            if (unlikely(b->func_kind == JS_FUNC_NORMAL)) {
+                JS_ThrowInternalError(ctx, "suspending opcode in a normal function");
+                goto exception;
+            }
             goto done_generator;
 
         CASE(OP_nop):
@@ -29866,6 +29877,12 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     bool is_await_using = false;
     if (tok == TOK_AWAIT) {
         int u;
+        /* `await` is a keyword token outside async functions too (modules,
+           class static blocks), but an `await using` binding may only be
+           declared where the function can await: its disposal emits
+           OP_await, which a normal function cannot execute. */
+        if (!(s->cur_func->func_kind & JS_FUNC_ASYNC))
+            return js_parse_error(s, "await using declaration is only valid in async functions");
         if (next_token(s))
             return -1;
         u = is_using(s, false);

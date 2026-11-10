@@ -2483,7 +2483,7 @@ static void parser_scope_out_of_memory(void)
 {
     static char src[1 << 16];
     size_t len = 0;
-    int unit;
+    int unit = 0;
     uint32_t headroom;
 
     /* A breadth of scope-pushing constructs: block, if, for, for-of, switch,
@@ -2550,6 +2550,51 @@ static void parser_scope_out_of_memory(void)
     }
 }
 
+/* `await` is a keyword token outside async functions too (in modules, in class
+   static blocks), and js_parse_for_in_of() accepted an `await using` head
+   there without asking whether the function could await. Its disposal emits
+   OP_await into a normal function, whose frame then left the interpreter
+   through the generator exit and skipped close_var_refs(). The parser must
+   refuse the declaration wherever `await` is refused, and still accept it in
+   async functions and at a module's top level. */
+static int compiles(const char *src, int flags)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue ret = JS_Eval(ctx, src, strlen(src), "<await-using>",
+                          flags | JS_EVAL_FLAG_COMPILE_ONLY);
+    int ok = !JS_IsException(ret);
+    if (!ok) {
+        JSValue e = JS_GetException(ctx);
+        const char *str = JS_ToCString(ctx, e);
+        assert(str != NULL);
+        assert(strstr(str, "SyntaxError") != NULL);
+        JS_FreeCString(ctx, str);
+        JS_FreeValue(ctx, e);
+    }
+    JS_FreeValue(ctx, ret);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return ok;
+}
+
+static void await_using_outside_async(void)
+{
+    const int script = JS_EVAL_TYPE_GLOBAL, module = JS_EVAL_TYPE_MODULE;
+
+    assert(!compiles("class C { static { for (await using x of []) {} } }", script));
+    assert(!compiles("class C { static { for (await using x in {}) {} } }", script));
+    assert(!compiles("function f() { for (await using x of []) {} }", module));
+    assert(!compiles("class C { static { for (await using x of []) {} } }", module));
+    assert(!compiles("export function f() { for (await using [a] of []) {} }", module));
+
+    assert(compiles("async function f() { for (await using x of []) {} }", script));
+    assert(compiles("(async () => { for (await using x of []) {} })", script));
+    assert(compiles("async function* g() { for (await using x of []) {} }", script));
+    assert(compiles("for (await using x of []) {}", module));
+    assert(compiles("function f() { for (using x of []) {} }", script));
+}
+
 /* The sibling of parser_scope_out_of_memory for the label array. new_label()
    returns -1 when the parser cannot grow fd->label_slots; the for-in/of and
    C-style for headers and js_parse_destructuring_element use the returned
@@ -2565,7 +2610,7 @@ static void parser_label_out_of_memory(void)
 {
     static char src[1 << 16];
     size_t len = 0;
-    int unit;
+    int unit = 0;
     uint32_t headroom;
 
     /* Each unit mints labels in the three headers that index by a new_label()
@@ -2675,6 +2720,7 @@ int main(void)
     uncatchable_out_of_memory();
     parser_scope_out_of_memory();
     parser_label_out_of_memory();
+    await_using_outside_async();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();
