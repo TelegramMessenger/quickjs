@@ -418,6 +418,8 @@ struct JSRuntime {
     bool in_build_stack_trace;
     /* true if inside JS_FreeRuntime */
     bool in_free;
+    bool in_reset_weak_ref;
+    struct JSWeakRefRecord *pending_weak_refs;
 
     struct JSStackFrame *current_stack_frame;
 
@@ -64705,7 +64707,7 @@ int JS_AddIntrinsicWeakRef(JSContext *ctx)
 
 static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
 {
-    JSWeakRefRecord *wr, *wr_next;
+    JSWeakRefRecord *wr, *wr_last;
     JSWeakRefData *wrd;
     JSMapRecord *mr;
     JSMapState *s;
@@ -64713,7 +64715,9 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
 
     /* first pass to remove the records from the WeakMap/WeakSet
        lists */
+    wr_last = NULL;
     for(wr = *first_weak_ref; wr != NULL; wr = wr->next_weak_ref) {
+        wr_last = wr;
         switch(wr->kind) {
         case JS_WEAK_REF_KIND_MAP:
             mr = wr->u.map_record;
@@ -64743,10 +64747,20 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
         }
     }
 
+    if (!wr_last)
+        return;
+    /* a freed value can be a symbol with weak references of its own: queue them, do not recurse */
+    wr_last->next_weak_ref = rt->pending_weak_refs;
+    rt->pending_weak_refs = *first_weak_ref;
+    *first_weak_ref = NULL;
+    if (rt->in_reset_weak_ref)
+        return;
+    rt->in_reset_weak_ref = true;
+
     /* second pass to free the values to avoid modifying the weak
        reference list while traversing it. */
-    for(wr = *first_weak_ref; wr != NULL; wr = wr_next) {
-        wr_next = wr->next_weak_ref;
+    while ((wr = rt->pending_weak_refs) != NULL) {
+        rt->pending_weak_refs = wr->next_weak_ref;
         switch(wr->kind) {
         case JS_WEAK_REF_KIND_MAP:
             mr = wr->u.map_record;
@@ -64792,8 +64806,7 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
         }
         js_free_rt(rt, wr);
     }
-
-    *first_weak_ref = NULL; /* fail safe */
+    rt->in_reset_weak_ref = false;
 }
 
 static bool is_valid_weakref_target(JSValueConst val)
