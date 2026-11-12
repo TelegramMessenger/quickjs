@@ -2826,6 +2826,33 @@ static void parser_allocation_failure(void)
         compile_with_alloc_failure(module, JS_EVAL_TYPE_MODULE, n);
 }
 
+static void resolver_allocation_failure(void)
+{
+    static const char *const uses[] = {
+        "arguments.length", "typeof f", "this",
+        "(() => arguments.length)()", "(() => typeof f)()", "(() => this)()",
+    };
+    char src[2048];
+    size_t len;
+    long n, requests;
+    int i, j;
+
+    /* the binding the resolver adds is the 107th variable: the hash table of the variables doubles */
+    for (j = 0; j < (int)countof(uses); j++) {
+        len = snprintf(src, sizeof(src), "(function f() { var v0");
+        for (i = 1; i < 106; i++)
+            len += snprintf(src + len, sizeof(src) - len, ", v%d", i);
+        len += snprintf(src + len, sizeof(src) - len, "; return [%s", uses[j]);
+        for (i = 0; i < 106; i++)
+            len += snprintf(src + len, sizeof(src) - len, ", v%d", i);
+        snprintf(src + len, sizeof(src) - len, "]; })");
+        requests = compile_with_alloc_failure(src, JS_EVAL_TYPE_GLOBAL, 0);
+        assert(requests > 0);
+        for (n = 1; n <= requests; n++)
+            compile_with_alloc_failure(src, JS_EVAL_TYPE_GLOBAL, n);
+    }
+}
+
 int main(void)
 {
     cfunctions();
@@ -2873,6 +2900,7 @@ int main(void)
     parser_label_out_of_memory();
     await_using_outside_async();
     parser_allocation_failure();
+    resolver_allocation_failure();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();

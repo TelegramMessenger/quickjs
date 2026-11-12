@@ -25233,8 +25233,11 @@ static int add_var(JSContext *ctx, JSFunctionDef *fd, JSAtom name)
     memset(vd, 0, sizeof(*vd));
     vd->var_name = JS_DupAtom(ctx, name);
     vd->func_pool_idx = -1;
-    if (update_var_htab(ctx, fd))
+    if (update_var_htab(ctx, fd)) {
+        JS_FreeAtom(ctx, vd->var_name);
+        fd->var_count--;
         return -1;
+    }
     return fd->var_count - 1;
 }
 
@@ -34641,6 +34644,7 @@ static int add_var_this(JSContext *ctx, JSFunctionDef *fd)
     return idx;
 }
 
+/* return the variable index, -1 if not a pseudo variable of 's', -2 if error */
 static int resolve_pseudo_var(JSContext *ctx, JSFunctionDef *s,
                                JSAtom var_name)
 {
@@ -34674,10 +34678,9 @@ static int resolve_pseudo_var(JSContext *ctx, JSFunctionDef *s,
         var_idx = s->this_var_idx;
         break;
     default:
-        var_idx = -1;
-        break;
+        return -1;
     }
-    return var_idx;
+    return var_idx < 0 ? -2 : var_idx;
 }
 
 /* test if 'var_name' is in the variable object on the stack. If is it
@@ -34761,17 +34764,24 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
             var_idx = find_var(ctx, s, var_name);
         }
 
-        if (var_idx < 0 && is_pseudo_var)
+        if (var_idx < 0 && is_pseudo_var) {
             var_idx = resolve_pseudo_var(ctx, s, var_name);
+            if (var_idx == -2)
+                return -1;
+        }
 
         if (var_idx < 0 && var_name == JS_ATOM_arguments &&
             s->has_arguments_binding) {
             /* 'arguments' pseudo variable */
             var_idx = add_arguments_var(ctx, s);
+            if (var_idx < 0)
+                return -1;
         }
         if (var_idx < 0 && s->is_func_expr && var_name == s->func_name) {
             /* add a new variable with the function name */
             var_idx = add_func_var(ctx, s, var_name);
+            if (var_idx < 0)
+                return -1;
         }
     }
     if (var_idx >= 0) {
@@ -34934,14 +34944,20 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
             var_idx = resolve_pseudo_var(ctx, fd, var_name);
             if (var_idx >= 0)
                 break;
+            if (var_idx == -2)
+                return -1;
         }
         if (var_name == JS_ATOM_arguments && fd->has_arguments_binding) {
             var_idx = add_arguments_var(ctx, fd);
+            if (var_idx < 0)
+                return -1;
             break;
         }
         if (fd->is_func_expr && fd->func_name == var_name) {
             /* add a new variable with the function name */
             var_idx = add_func_var(ctx, fd, var_name);
+            if (var_idx < 0)
+                return -1;
             break;
         }
 
