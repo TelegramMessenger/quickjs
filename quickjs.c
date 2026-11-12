@@ -17373,6 +17373,8 @@ static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
     tag = JS_VALUE_GET_TAG(obj);
     if (tag != JS_TAG_OBJECT && tag != JS_TAG_NULL && tag != JS_TAG_UNDEFINED) {
         obj = JS_ToObjectFree(ctx, obj);
+        if (JS_IsException(obj))
+            return JS_EXCEPTION;
     }
 
     it = js_malloc(ctx, sizeof(*it));

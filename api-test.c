@@ -3531,6 +3531,46 @@ static void module_function_normal_call(void)
     }
 }
 
+static void for_in_out_of_memory(void)
+{
+    static const char code[] =
+        "var s = 'ab'.repeat(2000);\n"
+        "function take() { var t = s; s = null; return t; }\n"
+        "function run() { for (var k in take()) break; }\n";
+    uint32_t headroom;
+    int oom_seen = 0;
+
+    /* the wrapper object of the string cannot be allocated, and releasing the string makes room again */
+    for (headroom = 0; headroom < 256; headroom += 8) {
+        JSRuntime *rt = JS_NewRuntime();
+        JSContext *ctx = JS_NewContext(rt);
+        JSMemoryUsage stats;
+        JSValue ret, global, run;
+
+        ret = eval(ctx, code);
+        assert(!JS_IsException(ret));
+        JS_FreeValue(ctx, ret);
+        global = JS_GetGlobalObject(ctx);
+        run = JS_GetPropertyStr(ctx, global, "run");
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, (size_t)stats.malloc_size + headroom);
+        ret = JS_Call(ctx, run, JS_UNDEFINED, 0, NULL);
+        JS_SetMemoryLimit(rt, 0);
+        if (JS_IsException(ret)) {
+            JSValue e = JS_GetException(ctx);
+            assert(JS_IsError(e));
+            JS_FreeValue(ctx, e);
+            oom_seen = 1;
+        }
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, run);
+        JS_FreeValue(ctx, global);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+    }
+    assert(oom_seen);
+}
+
 static void regexp_allocation_failure(void)
 {
     char src[2048], filler[400];
@@ -3860,6 +3900,7 @@ int main(void)
     private_symbols();
     new_context_low_memory();
     module_function_normal_call();
+    for_in_out_of_memory();
     json_stringify_oom();
     return 0;
 }
