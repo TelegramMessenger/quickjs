@@ -9497,10 +9497,10 @@ static JSValue js_bytecode_eval(JSContext *ctx, const uint8_t *bytecode,
 
     obj = JS_ReadObject(ctx, bytecode, len, JS_READ_OBJ_BYTECODE);
     if (JS_IsException(obj))
-        return JS_EXCEPTION;
+        goto fail;
     fun = JS_EvalFunction(ctx, obj);
     if (JS_IsException(fun))
-        return JS_EXCEPTION;
+        goto fail;
     assert(JS_IsFunction(ctx, fun));
     result = JS_Call(ctx, fun, JS_UNDEFINED, argc, vc(argv));
     for (i = 0; i < argc; i++)
@@ -9512,6 +9512,10 @@ static JSValue js_bytecode_eval(JSContext *ctx, const uint8_t *bytecode,
         return JS_EXCEPTION;
     }
     return result;
+ fail:
+    for (i = 0; i < argc; i++)
+        JS_FreeValue(ctx, argv[i]);
+    return JS_EXCEPTION;
 }
 
 static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,

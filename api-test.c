@@ -3332,6 +3332,57 @@ static void weak_map_symbol_key_teardown(void)
     }
 }
 
+static bool call_at_memory_limit(const char *setup, const char *arg,
+                                 size_t headroom)
+{
+    JSRuntime *rt = JS_NewRuntime2(&live_blocks_mf, NULL);
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue global_object, func, argv, ret;
+    JSMemoryUsage stats;
+    bool failed;
+
+    ret = eval(ctx, setup);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    global_object = JS_GetGlobalObject(ctx);
+    func = JS_GetPropertyStr(ctx, global_object, "f");
+    assert(JS_IsFunction(ctx, func));
+    argv = JS_NewString(ctx, arg);
+    JS_RunGC(rt);
+    JS_ComputeMemoryUsage(rt, &stats);
+    JS_SetMemoryLimit(rt, (size_t)stats.malloc_size + headroom);
+    ret = JS_Call(ctx, func, JS_UNDEFINED, 1, (JSValueConst *)&argv);
+    JS_SetMemoryLimit(rt, 0);
+    failed = JS_IsException(ret) || JS_HasException(ctx);
+    if (failed)
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, argv);
+    JS_FreeValue(ctx, func);
+    JS_FreeValue(ctx, global_object);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    /* a reference leaked by the failed call keeps the realm, and with it every large block */
+    assert(live_blocks == 0);
+    return failed;
+}
+
+static void lazy_builtin_out_of_memory(void)
+{
+    static const char setup[] =
+        "function f() { Array.fromAsync; Iterator.zip; Iterator.zipKeyed; }\n";
+    size_t headroom;
+    bool loaded = false, failed = false;
+
+    for (headroom = 0; headroom < 48 * 1024; headroom += 128) {
+        if (call_at_memory_limit(setup, "", headroom))
+            failed = true;
+        else
+            loaded = true;
+    }
+    assert(failed && loaded);
+}
+
 static void resolver_allocation_failure(void)
 {
     static const char *const uses[] = {
@@ -3669,6 +3720,7 @@ int main(void)
     module_value_outlives_context();
     module_pending_await();
     weak_map_symbol_key_teardown();
+    lazy_builtin_out_of_memory();
     parser_scope_out_of_memory();
     parser_label_out_of_memory();
     await_using_outside_async();
