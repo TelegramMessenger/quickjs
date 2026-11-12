@@ -828,6 +828,14 @@ typedef struct JSClosureVar {
 #define ARG_SCOPE_INDEX 1
 #define ARG_SCOPE_END (-2)
 
+/* OP_eval scope operand: scopes[].first + 1, so ARG_SCOPE_END is 0xffff */
+static inline int get_eval_scope_idx(const uint8_t *pc)
+{
+    int v = get_u16(pc);
+
+    return v == 0xffff ? ARG_SCOPE_END : v - 1;
+}
+
 typedef struct JSVarScope {
     int parent;  /* index into fd->scopes of the enclosing scope */
     int first;   /* index into fd->vars of the last variable in this scope */
@@ -19437,7 +19445,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue obj;
                 int scope_idx;
                 call_argc = get_u16(pc);
-                scope_idx = get_u16(pc + 2) - 1;
+                scope_idx = get_eval_scope_idx(pc + 2);
                 pc += 4;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
@@ -19469,7 +19477,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue *tab;
                 JSValue obj;
 
-                scope_idx = get_u16(pc) - 1;
+                scope_idx = get_eval_scope_idx(pc);
                 pc += 2;
                 sf->cur_pc = pc;
                 tab = build_arg_list(ctx, &len, sp[-1]);
@@ -36144,6 +36152,10 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
             {
                 int call_argc = get_u16(bc_buf + pos + 1);
                 scope = get_u16(bc_buf + pos + 1 + 2);
+                if (s->scopes[scope].first + 1 == 0xffff) {
+                    JS_ThrowSyntaxError(ctx, "too many local variables");
+                    goto fail;
+                }
                 mark_eval_captured_variables(ctx, s, scope);
                 dbuf_putc(&bc_out, op);
                 dbuf_put_u16(&bc_out, call_argc);
@@ -36152,6 +36164,10 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
             break;
         case OP_apply_eval: /* convert scope index to adjusted variable index */
             scope = get_u16(bc_buf + pos + 1);
+            if (s->scopes[scope].first + 1 == 0xffff) {
+                JS_ThrowSyntaxError(ctx, "too many local variables");
+                goto fail;
+            }
             mark_eval_captured_variables(ctx, s, scope);
             dbuf_putc(&bc_out, op);
             dbuf_put_u16(&bc_out, s->scopes[scope].first + 1);
