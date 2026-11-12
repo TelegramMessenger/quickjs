@@ -2928,6 +2928,17 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
     init_list_head(&rt->job_list);
 
+    /* the values of weak map entries keyed by a symbol are not seen by the GC */
+    for(i = 0; i < rt->atom_size; i++) {
+        JSAtomStruct *p = rt->atom_array[i];
+        if (!atom_is_free(p) && p->atom_type == JS_ATOM_TYPE_SYMBOL &&
+            p->first_weak_ref) {
+            JS_REF_COUNT(p)++;
+            reset_weak_ref(rt, &p->first_weak_ref);
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_SYMBOL, p));
+        }
+    }
+
     JS_RunGC(rt);
 
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS

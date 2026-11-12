@@ -3248,6 +3248,90 @@ static void module_pending_await(void)
     JS_FreeRuntime(rt);
 }
 
+static long live_blocks;
+
+static void *live_blocks_calloc(void *opaque, size_t count, size_t size)
+{
+    void *ptr = alloc_failure_calloc(opaque, count, size);
+
+    if (ptr)
+        live_blocks++;
+    return ptr;
+}
+
+static void *live_blocks_malloc(void *opaque, size_t size)
+{
+    void *ptr = alloc_failure_malloc(opaque, size);
+
+    if (ptr)
+        live_blocks++;
+    return ptr;
+}
+
+static void live_blocks_free(void *opaque, void *ptr)
+{
+    if (ptr)
+        live_blocks--;
+    alloc_failure_free(opaque, ptr);
+}
+
+static void *live_blocks_realloc(void *opaque, void *ptr, size_t size)
+{
+    void *ret = alloc_failure_realloc(opaque, ptr, size);
+
+    if (!ptr && ret)
+        live_blocks++;
+    return ret;
+}
+
+static const JSMallocFunctions live_blocks_mf = {
+    live_blocks_calloc,
+    live_blocks_malloc,
+    live_blocks_free,
+    live_blocks_realloc,
+    alloc_failure_usable_size,
+};
+
+static void weak_map_symbol_key_teardown(void)
+{
+    static const char *const codes[] = {
+        "var big = new Uint8Array(1 << 16);\n"
+        "var s = Symbol('key');\n"
+        "var wm = new WeakMap();\n"
+        "wm.set(s, {});\n",
+
+        "var big = new Uint8Array(1 << 16);\n"
+        "var wm = new WeakMap();\n"
+        "wm.set(Symbol.iterator, [big]);\n",
+
+        "var big = new Uint8Array(1 << 16);\n"
+        "var wm = new WeakMap();\n"
+        "(function () { var s = Symbol('own'); wm.set(s, { s, big }); })();\n",
+
+        "var big = new Uint8Array(1 << 16);\n"
+        "var s = Symbol('all');\n"
+        "var wm = new WeakMap(), ws = new WeakSet(), ref = new WeakRef(s);\n"
+        "var fr = new FinalizationRegistry(function () {});\n"
+        "wm.set(s, { ref, fr, wm, ws }); ws.add(s);\n"
+        "fr.register(s, { wm }, s); fr.register(s, ref);\n"
+        "wm.set(wm, s); wm.set(Symbol('gone'), big);\n",
+    };
+    size_t i;
+
+    /* the value of an entry keyed by a live symbol must not keep the heap after JS_FreeRuntime() */
+    for (i = 0; i < countof(codes); i++) {
+        JSRuntime *rt = JS_NewRuntime2(&live_blocks_mf, NULL);
+        JSContext *ctx = JS_NewContext(rt);
+        JSValue ret = eval(ctx, codes[i]);
+
+        assert(!JS_IsException(ret));
+        JS_FreeValue(ctx, ret);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+        assert(live_blocks == 0);
+    }
+}
+
 static void resolver_allocation_failure(void)
 {
     static const char *const uses[] = {
@@ -3584,6 +3668,7 @@ int main(void)
     finalization_registry_job_oom();
     module_value_outlives_context();
     module_pending_await();
+    weak_map_symbol_key_teardown();
     parser_scope_out_of_memory();
     parser_label_out_of_memory();
     await_using_outside_async();
