@@ -21805,6 +21805,7 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
     JSObject *p;
     JSContext *realm;
 
+ again:
     if (JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)
         return ctx;
     p = JS_VALUE_GET_OBJ(func_obj);
@@ -21830,17 +21831,13 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
             if (s->is_revoked) {
                 JS_ThrowTypeErrorRevokedProxy(ctx);
                 return NULL;
-            } else {
-                realm = JS_GetFunctionRealm(ctx, s->target);
             }
+            func_obj = s->target;
         }
-        break;
+        goto again;
     case JS_CLASS_BOUND_FUNCTION:
-        {
-            JSBoundFunction *bf = p->u.bound_function;
-            realm = JS_GetFunctionRealm(ctx, bf->func_obj);
-        }
-        break;
+        func_obj = p->u.bound_function->func_obj;
+        goto again;
     default:
         realm = ctx;
         break;
