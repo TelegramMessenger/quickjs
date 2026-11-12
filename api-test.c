@@ -3383,6 +3383,25 @@ static void lazy_builtin_out_of_memory(void)
     assert(failed && loaded);
 }
 
+static void set_prototype_out_of_memory(void)
+{
+    static const char setup[] =
+        "function mk() { var o = {}; for (var i = 0; i < 150; i++) o['p' + i] = i; return o; }\n"
+        "var a = mk(), b = mk(), proto = { tag: 1 };\n"
+        "function f() { Object.setPrototypeOf(a, proto); }\n";
+    size_t headroom;
+    bool done = false, failed = false;
+
+    /* a and b share their shape: a new prototype for a clones it first */
+    for (headroom = 0; headroom < 16 * 1024; headroom += 256) {
+        if (call_at_memory_limit(setup, "", headroom))
+            failed = true;
+        else
+            done = true;
+    }
+    assert(failed && done);
+}
+
 static void resolver_allocation_failure(void)
 {
     static const char *const uses[] = {
@@ -3721,6 +3740,7 @@ int main(void)
     module_pending_await();
     weak_map_symbol_key_teardown();
     lazy_builtin_out_of_memory();
+    set_prototype_out_of_memory();
     parser_scope_out_of_memory();
     parser_label_out_of_memory();
     await_using_outside_async();
