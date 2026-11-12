@@ -28300,7 +28300,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                                 fd->byte_code.buf[fd->last_opcode_pos] = opcode;
                             }
                         }
-                        drop_count = 1;
+                        drop_count = (opcode == OP_scope_get_ref) ? 2 : 1;
                     }
                     break;
                 case OP_get_super_value:
