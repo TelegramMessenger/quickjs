@@ -8672,6 +8672,8 @@ static int build_backtrace(JSContext *ctx, JSValueConst error_val,
     if (!JS_IsNull(ctx->error_ctor) && !uncatchable) {
         prepare = js_dup(ctx->error_prepare_stack);
         has_prepare = JS_IsFunction(ctx, prepare);
+        if (!has_prepare)
+            JS_FreeValue(ctx, prepare);
     }
 
     if (has_prepare) {
