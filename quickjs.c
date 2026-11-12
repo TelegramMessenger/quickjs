@@ -515,19 +515,7 @@ typedef struct JSVarRef {
     uint8_t is_detached;
     uint8_t is_lexical; /* only used with global variables */
     uint8_t is_const; /* only used with global variables */
-    /* Set at creation for an open var_ref that captures a local of a
-       coroutine (async function / generator / async generator): such a
-       var_ref holds a counted reference to that coroutine's GC object and
-       is itself a GC object, so the cycle collector can see the closure ->
-       var_ref -> coroutine edge and keep the suspended coroutine (hence the
-       captured variable it points into) alive. The coroutine is recovered
-       as stack_frame->cur_gc_obj (valid while open). This is a *snapshot* of
-       cur_gc_obj != NULL taken at creation, NOT rederived at read time:
-       cur_gc_obj transitions NULL -> owner (it is set only after a
-       generator's initial resume), so var_refs created during the prologue
-       (e.g. mapped `arguments`) must stay non-coro even though cur_gc_obj is
-       later set. Cleared when the var_ref is detached; the ref is released on
-       detach/free. */
+    /* an open var_ref into a coroutine frame: a GC object holding a reference to stack_frame->cur_gc_obj */
     uint8_t is_coro;
     JSValue *pvalue; /* pointer to the value, either on the stack or
                         to 'value' */
@@ -18467,6 +18455,22 @@ static void close_var_refs(JSRuntime *rt, JSStackFrame *sf)
     }
 }
 
+/* the parameter initialisers of a generator open var_refs before sf->cur_gc_obj exists */
+static void js_coro_adopt_var_refs(JSRuntime *rt, JSStackFrame *sf)
+{
+    JSVarRef *var_ref;
+    int i;
+
+    for (i = 0; i < sf->var_ref_count; i++) {
+        var_ref = sf->var_refs[i];
+        if (var_ref && !var_ref->is_detached && !var_ref->is_coro) {
+            var_ref->is_coro = true;
+            JS_REF_COUNT(sf->cur_gc_obj)++;
+            add_gc_object(rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
+        }
+    }
+}
+
 static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
                               JSStackFrame *sf, int var_idx)
 {
@@ -22261,10 +22265,8 @@ static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
     if (JS_IsException(obj))
         goto fail;
     JS_SetOpaqueInternal(obj, s);
-    /* the body only starts running on the first next(); root captured
-       locals against the generator object from now on (the initial resume
-       above only reaches OP_initial_yield, before any user code) */
     s->func_state.frame.cur_gc_obj = &JS_VALUE_GET_OBJ(obj)->header;
+    js_coro_adopt_var_refs(ctx->rt, &s->func_state.frame);
     return obj;
  fail:
     free_generator_stack_rt(ctx->rt, s);
@@ -22940,9 +22942,8 @@ static JSValue js_async_generator_function_call(JSContext *ctx,
     if (JS_IsException(obj))
         goto fail;
     s->generator = JS_VALUE_GET_OBJ(obj);
-    /* root captured locals against the async generator object (the initial
-       resume above only reaches OP_initial_yield, before any user code) */
     s->func_state.frame.cur_gc_obj = &s->generator->header;
+    js_coro_adopt_var_refs(ctx->rt, &s->func_state.frame);
     JS_SetOpaqueInternal(obj, s);
     return obj;
  fail:
