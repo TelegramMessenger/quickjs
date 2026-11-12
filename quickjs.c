@@ -50386,6 +50386,8 @@ static void js_regexp_finalizer(JSRuntime *rt, JSValueConst val)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
     JSRegExp *re = &p->u.regexp;
+    if (!re->bytecode)
+        return;
     JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, re->bytecode));
     JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, re->pattern));
 }
@@ -50523,8 +50525,11 @@ static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
         obj = js_create_from_ctor(ctx, ctor, JS_CLASS_REGEXP);
         if (JS_IsException(obj))
             goto fail;
-        JS_DefinePropertyValue(ctx, obj, JS_ATOM_lastIndex, prop.u.value,
-                               JS_PROP_WRITABLE);
+        if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_lastIndex, prop.u.value,
+                                   JS_PROP_WRITABLE) < 0) {
+            JS_FreeValue(ctx, obj);
+            goto fail;
+        }
     }
     p = JS_VALUE_GET_OBJ(obj);
     re = &p->u.regexp;
@@ -50939,7 +50944,7 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
     int rc, capture_count, alloc_count, shift, index, i, re_flags, prop_flags;
     JSRegExp *re = js_get_regexp(ctx, this_val, true);
     JSString *str;
-    JSValue t, ret, str_val, obj, val, groups;
+    JSValue t, ret, str_val, obj, val, groups, bc;
     JSValue indices, indices_groups;
     uint8_t *re_bytecode;
     uint8_t **capture, *str_buf;
@@ -50957,6 +50962,7 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
 
     ret = JS_EXCEPTION;
     obj = JS_NULL;
+    bc = JS_UNDEFINED;
     groups = JS_UNDEFINED;
     indices = JS_UNDEFINED;
     indices_groups = JS_UNDEFINED;
@@ -50967,6 +50973,8 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
     if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
         goto fail;
 
+    /* compile() called from a lastIndex setter must not free the bytecode that is still read below */
+    bc = js_dup(JS_MKPTR(JS_TAG_STRING, re->bytecode));
     re_bytecode = str8(re->bytecode);
     re_flags = lre_get_flags(re_bytecode);
     if ((re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) == 0) {
@@ -51152,6 +51160,7 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
     ret = obj;
     obj = JS_UNDEFINED;
 fail:
+    JS_FreeValue(ctx, bc);
     JS_FreeAtom(ctx, group_name);
     JS_FreeValue(ctx, indices_groups);
     JS_FreeValue(ctx, indices);

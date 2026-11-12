@@ -3613,6 +3613,55 @@ static void bind_out_of_memory(void)
     JS_FreeRuntime(rt);
 }
 
+static void regexp_last_index_out_of_memory(void)
+{
+    static const char setup[] =
+        "var P = Object.create(RegExp.prototype);\n"
+        "function NT() {}\n"
+        "NT.prototype = P;\n"
+        "var keep = Object.create(P);\n"
+        "var re;\n"
+        "function construct() { re = Reflect.construct(RegExp, ['(?<n>a)', 'g'], NT); }\n"
+        "function check() { return typeof re === 'object' && !Object.getOwnPropertyDescriptor(re, 'lastIndex'); }\n"
+        "construct();\n"
+        "check();\n"
+        "re = undefined;\n";
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSMemoryUsage stats;
+    JSValue ret, global, construct, check;
+    uint32_t headroom;
+    int failed = 0, constructed = 0;
+
+    ret = eval(ctx, setup);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    global = JS_GetGlobalObject(ctx);
+    construct = JS_GetPropertyStr(ctx, global, "construct");
+    check = JS_GetPropertyStr(ctx, global, "check");
+    /* the new object shares its empty shape with keep: defining lastIndex has to allocate */
+    for (headroom = 0; headroom < 4096 && !constructed; headroom += 8) {
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, (size_t)stats.malloc_size + headroom);
+        ret = JS_Call(ctx, construct, JS_UNDEFINED, 0, NULL);
+        JS_SetMemoryLimit(rt, 0);
+        if (JS_IsException(ret))
+            failed++;
+        else
+            constructed++;
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, ret);
+        ret = JS_Call(ctx, check, JS_UNDEFINED, 0, NULL);
+        assert(JS_IsBool(ret) && !JS_VALUE_GET_BOOL(ret));
+    }
+    assert(failed > 0 && constructed > 0);
+    JS_FreeValue(ctx, check);
+    JS_FreeValue(ctx, construct);
+    JS_FreeValue(ctx, global);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void regexp_allocation_failure(void)
 {
     char src[2048], filler[400];
@@ -3944,6 +3993,7 @@ int main(void)
     module_function_normal_call();
     for_in_out_of_memory();
     bind_out_of_memory();
+    regexp_last_index_out_of_memory();
     json_stringify_oom();
     return 0;
 }
