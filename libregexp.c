@@ -2305,6 +2305,9 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
             if (last_atom_start < 0) {
                 return re_parse_error(s, "nothing to repeat");
             }
+            /* the atom is read back below: it must have been emitted in full */
+            if (dbuf_error(&s->byte_code))
+                goto out_of_memory;
             {
                 bool need_capture_init, add_zero_advance_check;
                 int len, pos;

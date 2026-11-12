@@ -2853,6 +2853,24 @@ static void resolver_allocation_failure(void)
     }
 }
 
+static void regexp_allocation_failure(void)
+{
+    char src[2048], filler[400];
+    long n, requests;
+
+    /* in the first four patterns \1 or the class is the last byte its byte code buffer has room for */
+    memset(filler, 'a', sizeof(filler));
+    snprintf(src, sizeof(src),
+             "[/(.)%.218s\\1*/, /(.)%.218s[a-c]+/, /(.)%.331s.\\1{2,3}/,"
+             " /(.)%.331s.[^a-c]?/i, /(.)\\1*/, /(?<n>.)\\k<n>+/, /(.)[a-c]*/,"
+             " /.[a-c]*/y, /(?<=(.)\\1*)/, /(.)[\\q{ab|c}]*/v].length;",
+             filler, filler, filler, filler);
+    requests = compile_with_alloc_failure(src, JS_EVAL_TYPE_GLOBAL, 0);
+    assert(requests > 0);
+    for (n = 1; n <= requests; n++)
+        compile_with_alloc_failure(src, JS_EVAL_TYPE_GLOBAL, n);
+}
+
 int main(void)
 {
     cfunctions();
@@ -2901,6 +2919,7 @@ int main(void)
     await_using_outside_async();
     parser_allocation_failure();
     resolver_allocation_failure();
+    regexp_allocation_failure();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();
