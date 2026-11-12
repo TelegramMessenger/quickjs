@@ -2747,9 +2747,8 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
     rt->sab_funcs = *sf;
 }
 
-/* return 0 if OK, < 0 if exception */
-int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
-                  int argc, JSValueConst *argv)
+static int js_enqueue_job(JSContext *ctx, JSJobFunc *job_func,
+                          int argc, JSValueConst *argv, bool no_exception)
 {
     JSRuntime *rt = ctx->rt;
     JSJobEntry *e;
@@ -2757,7 +2756,10 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
 
     assert(!rt->in_free);
 
-    e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
+    if (no_exception)
+        e = js_malloc_rt(rt, sizeof(*e) + argc * sizeof(JSValue));
+    else
+        e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
     if (!e)
         return -1;
     e->ctx = ctx;
@@ -2768,6 +2770,13 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     }
     list_add_tail(&e->link, &rt->job_list);
     return 0;
+}
+
+/* return 0 if OK, < 0 if exception */
+int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+                  int argc, JSValueConst *argv)
+{
+    return js_enqueue_job(ctx, job_func, argc, argv, false);
 }
 
 bool JS_IsJobPending(JSRuntime *rt)
@@ -64772,7 +64781,8 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
                 JSValueConst args[2];
                 args[0] = fre->cb;
                 args[1] = fre->held_val;
-                JS_EnqueueJob(fre->ctx, js_finrec_job, 2, args);
+                /* a free must not throw: without memory for the job the callback is dropped */
+                js_enqueue_job(fre->ctx, js_finrec_job, 2, args, true);
             }
             js_finrec_free(rt, fre);
             break;

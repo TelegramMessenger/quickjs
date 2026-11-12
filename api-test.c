@@ -3159,6 +3159,51 @@ static void finalizer_allocation_runs_no_gc(void)
     JS_FreeRuntime(rt);
 }
 
+static void finalization_registry_job_oom(void)
+{
+    static const char setup_code[] =
+        "globalThis.calls = 0;\n"
+        "globalThis.registry = new FinalizationRegistry(() => { calls++; });\n"
+        "globalThis.targets = [{}, {}];\n"
+        "registry.register(targets[0], 0);\n"
+        "registry.register(targets[1], 1);\n"
+        "globalThis.drop = (i) => { targets[i] = null; };\n";
+    JSValue global_object, func, arg, ret;
+    JSContext *ctx, *job_ctx;
+    JSRuntime *rt;
+
+    rt = new_runtime();
+    ctx = JS_NewContext(rt);
+    ret = eval(ctx, setup_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    global_object = JS_GetGlobalObject(ctx);
+    func = JS_GetPropertyStr(ctx, global_object, "drop");
+    assert(JS_IsFunction(ctx, func));
+
+    /* no memory for the cleanup job of the first target: nothing is thrown or queued */
+    arg = JS_NewInt32(ctx, 0);
+    JS_SetMemoryLimit(rt, 1);
+    ret = JS_Call(ctx, func, JS_UNDEFINED, 1, (JSValueConst *)&arg);
+    JS_SetMemoryLimit(rt, 0);
+    assert(JS_IsUndefined(ret));
+    assert(!JS_HasException(ctx));
+    assert(!JS_IsJobPending(rt));
+
+    arg = JS_NewInt32(ctx, 1);
+    ret = JS_Call(ctx, func, JS_UNDEFINED, 1, (JSValueConst *)&arg);
+    assert(JS_IsUndefined(ret));
+    assert(JS_ExecutePendingJob(rt, &job_ctx) == 1);
+    assert(!JS_IsJobPending(rt));
+    ret = JS_GetPropertyStr(ctx, global_object, "calls");
+    assert(JS_VALUE_GET_TAG(ret) == JS_TAG_INT && JS_VALUE_GET_INT(ret) == 1);
+
+    JS_FreeValue(ctx, func);
+    JS_FreeValue(ctx, global_object);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void resolver_allocation_failure(void)
 {
     static const char *const uses[] = {
@@ -3492,6 +3537,7 @@ int main(void)
     shape_resize_allocation_failure();
     out_of_memory_exception_runs_no_gc();
     finalizer_allocation_runs_no_gc();
+    finalization_registry_job_oom();
     parser_scope_out_of_memory();
     parser_label_out_of_memory();
     await_using_outside_async();
