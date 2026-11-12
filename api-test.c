@@ -2949,6 +2949,60 @@ static void normalize_out_of_memory(void)
     assert(oom_seen && done_seen);
 }
 
+static JSValue return_exception(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    return JS_EXCEPTION;
+}
+
+static void exception_without_value(void)
+{
+    static const char *const code[] = {
+        "try { fail(); } catch (e) { caught = typeof e; }",
+        "try { Reflect.apply(fail, null, []); } catch (e) { caught = typeof e; }",
+        "Promise.resolve().then(fail).catch(e => { caught = typeof e; });",
+        "(async () => { fail(); })().catch(e => { caught = typeof e; });",
+    };
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt), *job_ctx;
+    JSValue global, ret, e;
+    const char *str;
+    int i, r;
+
+    global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "fail",
+                      JS_NewCFunction(ctx, return_exception, "fail", 0));
+    ret = eval(ctx, "var caught = 'none';");
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    for (i = 0; i < (int)countof(code); i++) {
+        ret = eval(ctx, code[i]);
+        r = JS_IsException(ret) ? -1 : 0;
+        JS_FreeValue(ctx, ret);
+        while (r == 0 && JS_IsJobPending(rt))
+            r = JS_ExecutePendingJob(rt, &job_ctx) < 0 ? -1 : 0;
+        /* the function threw nothing: the script is stopped instead of catching the "no exception" marker */
+        assert(r < 0);
+        e = JS_GetException(ctx);
+        assert(JS_IsError(e));
+        assert(JS_IsUncatchableError(e));
+        JS_FreeValue(ctx, e);
+        while (JS_IsJobPending(rt)) {
+            if (JS_ExecutePendingJob(rt, &job_ctx) < 0)
+                JS_FreeValue(job_ctx, JS_GetException(job_ctx));
+        }
+    }
+    ret = JS_GetPropertyStr(ctx, global, "caught");
+    str = JS_ToCString(ctx, ret);
+    assert(str != NULL);
+    assert(!strcmp(str, "none"));
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, global);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     cfunctions();
@@ -3000,6 +3054,7 @@ int main(void)
     regexp_allocation_failure();
     with_branch_polls_interrupts();
     normalize_out_of_memory();
+    exception_without_value();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();

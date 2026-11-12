@@ -9122,6 +9122,13 @@ static inline __exception int js_poll_interrupts(JSContext *ctx)
     }
 }
 
+/* JS_EXCEPTION came back with nothing thrown: a catch clause must not receive JS_UNINITIALIZED */
+static no_inline void js_throw_missing_exception(JSContext *ctx)
+{
+    if (!JS_HasException(ctx) && !js_uncatchable_pending(ctx))
+        JS_ThrowInternalError(ctx, "exception without a value");
+}
+
 /* return -1 (exception) or true/false */
 static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
                                    JSValueConst proto_val, bool throw_flag)
@@ -18777,8 +18784,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         not_a_function:
             return JS_ThrowTypeErrorNotAFunction(caller_ctx);
         }
-        return call_func(caller_ctx, func_obj, this_obj, argc,
-                         argv, flags);
+        ret_val = call_func(caller_ctx, func_obj, this_obj, argc,
+                            argv, flags);
+        if (unlikely(JS_IsException(ret_val)))
+            js_throw_missing_exception(caller_ctx);
+        return ret_val;
     }
     b = p->u.func.function_bytecode;
 
@@ -21666,6 +21676,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
+    if (unlikely(JS_IsUninitialized(rt->current_exception))) {
+        sf->cur_pc = pc;
+        js_throw_missing_exception(ctx);
+    }
     if (needs_backtrace(rt->current_exception)
     || JS_IsUndefined(ctx->error_back_trace)) {
         sf->cur_pc = pc;
