@@ -29643,6 +29643,8 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
     JSContext *ctx = s->ctx;
     JSFunctionDef *fd = s->cur_func;
     JSAtom name = JS_ATOM_NULL;
+    BlockEnv using_be;
+    bool has_using_be = false;
 
     for (;;) {
         if (s->token.val == TOK_IDENT) {
@@ -29720,6 +29722,12 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                                stack instead of catch_offset. */
                             emit_goto(s, OP_catch,
                                 fd->scopes[fd->scope_level].using_label_catch);
+                            /* the caller adds its entry after this statement: a `yield` in the rest of it needs one too */
+                            push_break_entry(fd, &using_be, JS_ATOM_NULL,
+                                             -1, -1, 1);
+                            using_be.has_using = true;
+                            using_be.using_scope_level = fd->scope_level;
+                            has_using_be = true;
                         }
                         if (is_await)
                             fd->scopes[fd->scope_level].is_await_using = 1;
@@ -29779,6 +29787,8 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
         if (next_token(s))
             return -1;
     }
+    if (has_using_be)
+        pop_break_entry(fd);
     return 0;
 
  var_error:
