@@ -11027,6 +11027,9 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop
     int desc_flags;
     int ret;
 
+    /* the result of a failed call passed on unchecked: its error is pending, the marker must not be stored */
+    if (unlikely(JS_IsException(val)))
+        return -1;
     switch(JS_VALUE_GET_TAG(this_obj)) {
     case JS_TAG_NULL:
         if (JS_IsObject(obj)) {
@@ -11299,6 +11302,10 @@ int JS_SetProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop, JSValue v
 int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                         JSValue prop, JSValue val, int flags)
 {
+    if (unlikely(JS_IsException(val))) {
+        JS_FreeValue(ctx, prop);
+        return -1;
+    }
     if (likely(JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT &&
                JS_VALUE_GET_TAG(prop) == JS_TAG_INT)) {
         JSObject *p;
@@ -12007,6 +12014,8 @@ int JS_DefinePropertyValue(JSContext *ctx, JSValueConst this_obj,
                            JSAtom prop, JSValue val, int flags)
 {
     int ret;
+    if (unlikely(JS_IsException(val)))
+        return -1;
     ret = JS_DefinePropertyValueConst(ctx, this_obj, prop, val, flags);
     JS_FreeValue(ctx, val);
     return ret;

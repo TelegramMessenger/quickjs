@@ -3077,6 +3077,39 @@ static void function_name_allocation_failure(void)
         "function check() { return F !== null && typeof F.name == 'unknown'; }\n");
 }
 
+static void exception_value_not_stored(void)
+{
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue obj = JS_NewObject(ctx), arr = JS_NewArray(ctx), ret;
+    JSAtom atom = JS_NewAtom(ctx, "c");
+    JSPropertyEnum *tab;
+    uint32_t len;
+
+    /* what a caller does when it passes on a failed JS_New*() call without looking at it */
+    assert(JS_SetPropertyStr(ctx, obj, "a", JS_EXCEPTION) < 0);
+    assert(JS_DefinePropertyValueStr(ctx, obj, "b", JS_EXCEPTION,
+                                     JS_PROP_C_W_E) < 0);
+    assert(JS_SetProperty(ctx, obj, atom, JS_EXCEPTION) < 0);
+    assert(JS_DefinePropertyValue(ctx, obj, atom, JS_EXCEPTION,
+                                  JS_PROP_C_W_E) < 0);
+    assert(JS_SetPropertyUint32(ctx, arr, 0, JS_EXCEPTION) < 0);
+    assert(JS_SetPropertyInt64(ctx, arr, 0, JS_EXCEPTION) < 0);
+    assert(JS_DefinePropertyValueUint32(ctx, arr, 0, JS_EXCEPTION,
+                                        JS_PROP_C_W_E) < 0);
+    assert(JS_SetPropertyUint32(ctx, obj, 7, JS_EXCEPTION) < 0);
+    JS_FreeAtom(ctx, atom);
+    ret = JS_GetPropertyStr(ctx, arr, "length");
+    assert(JS_VALUE_GET_TAG(ret) == JS_TAG_INT && JS_VALUE_GET_INT(ret) == 0);
+    assert(JS_GetOwnPropertyNames(ctx, &tab, &len, obj, JS_GPN_STRING_MASK) == 0);
+    assert(len == 0);
+    JS_FreePropertyEnum(ctx, tab, len);
+    JS_FreeValue(ctx, arr);
+    JS_FreeValue(ctx, obj);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     cfunctions();
@@ -3131,6 +3164,7 @@ int main(void)
     exception_without_value();
     own_property_value_allocation_failure();
     function_name_allocation_failure();
+    exception_value_not_stored();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();
