@@ -2871,6 +2871,43 @@ static void regexp_allocation_failure(void)
         compile_with_alloc_failure(src, JS_EVAL_TYPE_GLOBAL, n);
 }
 
+static int count_interrupt_handler(JSContext *ctx, void *opaque)
+{
+    int *polls = (int *)opaque;
+    ++*polls;
+    return 0;
+}
+
+static void with_branch_polls_interrupts(void)
+{
+    /* the OP_with_put_var of `var x` is the only backward branch of this loop, which ends when a[j] runs out */
+    static const char setup[] =
+        "var a = [];"
+        "for (var i = 0; i < 100000; i++) a[i] = { v: i };"
+        "function f() {"
+        "    return eval('var j = 0;"
+        " try { for (;;) var x = a[j++].v; } catch (e) {} j');"
+        "}";
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue ret;
+    int polls = 0;
+
+    ret = eval(ctx, setup);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    JS_SetInterruptHandler(rt, count_interrupt_handler, &polls);
+    ret = eval(ctx, "f()");
+    JS_SetInterruptHandler(rt, NULL, NULL);
+    assert(JS_VALUE_GET_TAG(ret) == JS_TAG_INT);
+    assert(JS_VALUE_GET_INT(ret) == 100001);
+    /* 100000 iterations, the handler is called every 10000 polls */
+    assert(polls >= 5);
+    JS_FreeValue(ctx, ret);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     cfunctions();
@@ -2920,6 +2957,7 @@ int main(void)
     parser_allocation_failure();
     resolver_allocation_failure();
     regexp_allocation_failure();
+    with_branch_polls_interrupts();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();
