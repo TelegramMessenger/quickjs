@@ -6531,9 +6531,16 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
                     pr = &p->prop[0];
                 } else {
                     /* only used for the first array */
-                    /* cannot fail */
                     pr = add_property(ctx, p, JS_ATOM_length,
                                       JS_PROP_WRITABLE | JS_PROP_LENGTH);
+                    if (unlikely(!pr)) {
+                        /* add_property() may have replaced the shape */
+                        sh = p->shape;
+                        if (p->prop != js_object_inline_prop(p))
+                            js_free(ctx, p->prop);
+                        js_free(ctx, p);
+                        goto fail;
+                    }
                 }
                 pr->u.value = js_int32(0);
             }

@@ -2794,6 +2794,50 @@ static void slice_atom_releases_parent(void)
     JS_FreeRuntime(rt);
 }
 
+static void array_length_oom(void)
+{
+    static const char setup_code[] =
+        "globalThis.kept = [];\n"
+        "globalThis.f = () => {\n"
+        "    for (let i = 0; i < 4; i++) {\n"
+        "        const C = class extends Array {};\n"
+        "        kept.push(Object.create(C.prototype), new C());\n"
+        "    }\n"
+        "};\n"
+        "f();\n";
+    JSValue global_object, func, ret;
+    JSMemoryUsage stats;
+    uint32_t headroom;
+    JSRuntime *rt;
+    JSContext *ctx;
+
+    rt = new_runtime();
+    ctx = JS_NewContext(rt);
+    global_object = JS_GetGlobalObject(ctx);
+
+    ret = eval(ctx, setup_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+
+    func = JS_GetPropertyStr(ctx, global_object, "f");
+    assert(JS_IsFunction(ctx, func));
+
+    for (headroom = 0; headroom < 16384; headroom += 8) {
+        JS_RunGC(rt);
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, (size_t)stats.malloc_size + headroom);
+        ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);
+        JS_SetMemoryLimit(rt, 0);
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+
+    JS_FreeValue(ctx, func);
+    JS_FreeValue(ctx, global_object);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void parser_allocation_failure(void)
 {
     static const char script[] =
@@ -3173,6 +3217,7 @@ int main(void)
     new_typed_array();
     std_eval_interrupt_handler();
     slice_atom_releases_parent();
+    array_length_oom();
     uncatchable_interrupt_sites();
     uncatchable_interrupt_at_memory_limit();
     uncatchable_out_of_memory();
