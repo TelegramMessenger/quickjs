@@ -37677,6 +37677,9 @@ typedef struct StackSizeState {
     int stack_len_max;
     uint16_t *stack_level_tab;
     int32_t *catch_pos_tab;
+    /* for an instruction: the entry of the finally block it runs in, or -1; for an entry: the block around it */
+    int32_t *sub_pos_tab;
+    int32_t *sub_parent_tab;
     int *pc_stack;
     int pc_stack_len;
     int pc_stack_size;
@@ -37684,7 +37687,8 @@ typedef struct StackSizeState {
 
 /* 'op' is only used for error indication */
 static __exception int ss_check(JSContext *ctx, StackSizeState *s,
-                                int pos, int op, int stack_len, int catch_pos)
+                                int pos, int op, int stack_len, int catch_pos,
+                                int sub_pos)
 {
     if ((unsigned)pos >= s->bc_len) {
         JS_ThrowInternalError(ctx, "bytecode buffer overflow (op=%d, pc=%d)", op, pos);
@@ -37707,6 +37711,10 @@ static __exception int ss_check(JSContext *ctx, StackSizeState *s,
             JS_ThrowInternalError(ctx, "inconsistent catch position: %d %d (pc=%d)",
                                   s->catch_pos_tab[pos], catch_pos, pos);
             return -1;
+        } else if (s->sub_pos_tab[pos] != sub_pos) {
+            JS_ThrowInternalError(ctx, "inconsistent finally block: %d %d (pc=%d)",
+                                  s->sub_pos_tab[pos], sub_pos, pos);
+            return -1;
         } else {
             return 0;
         }
@@ -37715,6 +37723,7 @@ static __exception int ss_check(JSContext *ctx, StackSizeState *s,
     /* mark as explored and store the stack size */
     s->stack_level_tab[pos] = stack_len;
     s->catch_pos_tab[pos] = catch_pos;
+    s->sub_pos_tab[pos] = sub_pos;
 
     /* queue the new PC to explore */
     if (js_resize_array(ctx, (void **)&s->pc_stack, sizeof(s->pc_stack[0]),
@@ -37730,6 +37739,7 @@ static __exception int compute_stack_size(JSContext *ctx,
 {
     StackSizeState s_s, *s = &s_s;
     int i, diff, n_pop, pos_next, stack_len, pos, op, catch_pos, catch_level;
+    int sub_pos, sub_entry;
     const JSOpCode *oi;
     const uint8_t *bc_buf;
 
@@ -37743,8 +37753,16 @@ static __exception int compute_stack_size(JSContext *ctx,
     for(i = 0; i < s->bc_len; i++)
         s->stack_level_tab[i] = 0xffff;
     s->pc_stack = NULL;
+    s->sub_pos_tab = NULL;
+    s->sub_parent_tab = NULL;
     s->catch_pos_tab = js_malloc(ctx, sizeof(s->catch_pos_tab[0]) * s->bc_len);
     if (!s->catch_pos_tab)
+        goto fail;
+    s->sub_pos_tab = js_malloc(ctx, sizeof(s->sub_pos_tab[0]) * s->bc_len);
+    if (!s->sub_pos_tab)
+        goto fail;
+    s->sub_parent_tab = js_malloc(ctx, sizeof(s->sub_parent_tab[0]) * s->bc_len);
+    if (!s->sub_parent_tab)
         goto fail;
 
     s->stack_len_max = 0;
@@ -37752,13 +37770,14 @@ static __exception int compute_stack_size(JSContext *ctx,
     s->pc_stack_size = 0;
 
     /* breadth-first graph exploration */
-    if (ss_check(ctx, s, 0, OP_invalid, 0, -1))
+    if (ss_check(ctx, s, 0, OP_invalid, 0, -1, -1))
         goto fail;
 
     while (s->pc_stack_len > 0) {
         pos = s->pc_stack[--s->pc_stack_len];
         stack_len = s->stack_level_tab[pos];
         catch_pos = s->catch_pos_tab[pos];
+        sub_pos = s->sub_pos_tab[pos];
         op = bc_buf[pos];
         if (op == 0 || op >= OP_COUNT) {
             JS_ThrowInternalError(ctx, "invalid opcode (op=%d, pc=%d)", op, pos);
@@ -37786,6 +37805,14 @@ static __exception int compute_stack_size(JSContext *ctx,
             JS_ThrowInternalError(ctx, "stack underflow (op=%d, pc=%d)", op, pos);
             goto fail;
         }
+        /* OP_ret must find the return address its OP_gosub pushed: no operand of the block may have reached it */
+        if (op == OP_ret &&
+            (sub_pos < 0 || stack_len != s->stack_level_tab[sub_pos])) {
+            JS_ThrowInternalError(ctx, "invalid ret (pc=%d)", pos);
+            goto fail;
+        }
+        while (sub_pos >= 0 && stack_len - n_pop < s->stack_level_tab[sub_pos])
+            sub_pos = s->sub_parent_tab[sub_pos];
         stack_len += oi->n_push - n_pop;
         if (stack_len > s->stack_len_max) {
             s->stack_len_max = stack_len;
@@ -37819,41 +37846,51 @@ static __exception int compute_stack_size(JSContext *ctx,
         case OP_if_true8:
         case OP_if_false8:
             diff = (int8_t)bc_buf[pos + 1];
-            if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
+            if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos, sub_pos))
                 goto fail;
             break;
         case OP_if_true:
         case OP_if_false:
             diff = get_u32(bc_buf + pos + 1);
-            if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
+            if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos, sub_pos))
                 goto fail;
             break;
         case OP_gosub:
             diff = get_u32(bc_buf + pos + 1);
-            if (ss_check(ctx, s, pos + 1 + diff, op, stack_len + 1, catch_pos))
+            sub_entry = pos + 1 + diff;
+            if ((unsigned)sub_entry < s->bc_len &&
+                s->stack_level_tab[sub_entry] == 0xffff)
+                s->sub_parent_tab[sub_entry] = sub_pos;
+            if (ss_check(ctx, s, sub_entry, op, stack_len + 1, catch_pos,
+                         sub_entry))
                 goto fail;
+            if (s->sub_parent_tab[sub_entry] != sub_pos) {
+                JS_ThrowInternalError(ctx, "inconsistent finally block: %d %d (pc=%d)",
+                                      s->sub_parent_tab[sub_entry], sub_pos, pos);
+                goto fail;
+            }
             break;
         case OP_with_get_var:
         case OP_with_delete_var:
             diff = get_u32(bc_buf + pos + 5);
-            if (ss_check(ctx, s, pos + 5 + diff, op, stack_len + 1, catch_pos))
+            if (ss_check(ctx, s, pos + 5 + diff, op, stack_len + 1, catch_pos, sub_pos))
                 goto fail;
             break;
         case OP_with_make_ref:
         case OP_with_get_ref:
         case OP_with_get_ref_undef:
             diff = get_u32(bc_buf + pos + 5);
-            if (ss_check(ctx, s, pos + 5 + diff, op, stack_len + 2, catch_pos))
+            if (ss_check(ctx, s, pos + 5 + diff, op, stack_len + 2, catch_pos, sub_pos))
                 goto fail;
             break;
         case OP_with_put_var:
             diff = get_u32(bc_buf + pos + 5);
-            if (ss_check(ctx, s, pos + 5 + diff, op, stack_len - 1, catch_pos))
+            if (ss_check(ctx, s, pos + 5 + diff, op, stack_len - 1, catch_pos, sub_pos))
                 goto fail;
             break;
         case OP_catch:
             diff = get_u32(bc_buf + pos + 1);
-            if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
+            if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos, sub_pos))
                 goto fail;
             catch_pos = pos;
             break;
@@ -37903,17 +37940,23 @@ static __exception int compute_stack_size(JSContext *ctx,
         default:
             break;
         }
-        if (ss_check(ctx, s, pos_next, op, stack_len, catch_pos))
+        while (sub_pos >= 0 && stack_len < s->stack_level_tab[sub_pos])
+            sub_pos = s->sub_parent_tab[sub_pos];
+        if (ss_check(ctx, s, pos_next, op, stack_len, catch_pos, sub_pos))
             goto fail;
     done_insn: ;
     }
     js_free(ctx, s->pc_stack);
+    js_free(ctx, s->sub_parent_tab);
+    js_free(ctx, s->sub_pos_tab);
     js_free(ctx, s->catch_pos_tab);
     js_free(ctx, s->stack_level_tab);
     *pstack_size = s->stack_len_max;
     return 0;
  fail:
     js_free(ctx, s->pc_stack);
+    js_free(ctx, s->sub_parent_tab);
+    js_free(ctx, s->sub_pos_tab);
     js_free(ctx, s->catch_pos_tab);
     js_free(ctx, s->stack_level_tab);
     *pstack_size = 0;
