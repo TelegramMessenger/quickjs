@@ -7379,6 +7379,8 @@ static void js_bound_function_finalizer(JSRuntime *rt, JSValueConst val)
     JSBoundFunction *bf = p->u.bound_function;
     int i;
 
+    if (!bf)
+        return;
     JS_FreeValueRT(rt, bf->func_obj);
     JS_FreeValueRT(rt, bf->this_val);
     for(i = 0; i < bf->argc; i++) {
@@ -7394,6 +7396,8 @@ static void js_bound_function_mark(JSRuntime *rt, JSValueConst val,
     JSBoundFunction *bf = p->u.bound_function;
     int i;
 
+    if (!bf)
+        return;
     JS_MarkValue(rt, bf->func_obj, mark_func);
     JS_MarkValue(rt, bf->this_val, mark_func);
     for(i = 0; i < bf->argc; i++)

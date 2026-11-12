@@ -3571,6 +3571,48 @@ static void for_in_out_of_memory(void)
     assert(oom_seen);
 }
 
+static void bind_out_of_memory(void)
+{
+    static const char code[] =
+        "function f() {}\n"
+        "function run() { return f.bind(null, 1, 2, 3); }\n"
+        "run();\n";
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSMemoryUsage stats;
+    JSValue ret, global, run;
+    uint32_t headroom;
+    int oom_seen = 0, bound_seen = 0;
+
+    ret = eval(ctx, code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    global = JS_GetGlobalObject(ctx);
+    run = JS_GetPropertyStr(ctx, global, "run");
+    /* at some limit there is room for the bound function object and none for its record */
+    for (headroom = 0; headroom < 2048; headroom += 8) {
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, (size_t)stats.malloc_size + headroom);
+        ret = JS_Call(ctx, run, JS_UNDEFINED, 0, NULL);
+        JS_SetMemoryLimit(rt, 0);
+        if (JS_IsException(ret)) {
+            JSValue e = JS_GetException(ctx);
+            assert(JS_IsError(e));
+            JS_FreeValue(ctx, e);
+            oom_seen = 1;
+        } else {
+            assert(JS_IsFunction(ctx, ret));
+            bound_seen = 1;
+        }
+        JS_FreeValue(ctx, ret);
+    }
+    assert(oom_seen && bound_seen);
+    JS_FreeValue(ctx, run);
+    JS_FreeValue(ctx, global);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void regexp_allocation_failure(void)
 {
     char src[2048], filler[400];
@@ -3901,6 +3943,7 @@ int main(void)
     new_context_low_memory();
     module_function_normal_call();
     for_in_out_of_memory();
+    bind_out_of_memory();
     json_stringify_oom();
     return 0;
 }
