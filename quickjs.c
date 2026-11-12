@@ -27472,7 +27472,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
             int prop_type;
             if (s->token.val == TOK_ELLIPSIS) {
                 if (!has_ellipsis) {
-                    JS_ThrowInternalError(s->ctx, "unexpected ellipsis token");
+                    js_parse_error(s, "too complicated destructuring expression");
                     return -1;
                 }
                 if (next_token(s))
@@ -27511,7 +27511,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
             label_lvalue = -1;
             depth_lvalue = 0;
             if (prop_type == PROP_TYPE_IDENT) {
-                if (next_token(s))
+                if (js_parse_expect(s, ':'))
                     goto prop_error;
                 if ((s->token.val == '[' || s->token.val == '{')
                     &&  ((tok1 = js_parse_skip_parens_token(s, &skip_bits, false)) == ',' ||
