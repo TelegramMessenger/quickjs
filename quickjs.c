@@ -17490,6 +17490,8 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
     }
     /* return the property */
     sp[0] = JS_AtomToValue(ctx, prop);
+    if (unlikely(JS_IsException(sp[0])))
+        return -1;
     sp[1] = JS_FALSE;
     return 0;
  done:
