@@ -1737,6 +1737,9 @@ JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
 static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     bool force_gc;
+    /* a failed allocation is no place to collect: its caller can be free_object() */
+    if (rt->in_out_of_memory)
+        return;
 #ifdef FORCE_GC_AT_MALLOC
     force_gc = true;
 #else

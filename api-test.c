@@ -3051,6 +3051,59 @@ static void shape_resize_allocation_failure(void)
                             true);
 }
 
+static void out_of_memory_exception_runs_no_gc(void)
+{
+    static const char setup_code[] =
+        "var cycle = {};\n"
+        "cycle.self = cycle;\n"
+        "globalThis.probe = new WeakRef(cycle);\n"
+        "cycle = null;\n"
+        "globalThis.alive = () => probe.deref() !== undefined;\n"
+        "globalThis.registry = new FinalizationRegistry(() => {});\n"
+        "globalThis.target = {};\n"
+        "registry.register(target, 1);\n"
+        "globalThis.grow = (n) => { 'x'.repeat(n); };\n"
+        "globalThis.drop = () => { target = null; };\n"
+        "grow(1);\n";
+    static const char *const names[] = { "grow", "drop" };
+    JSValue global_object, alive, func, size, ret;
+    JSRuntime *rt;
+    JSContext *ctx;
+    int i;
+
+    rt = new_runtime();
+    JS_SetGCThreshold(rt, (size_t)-1);
+    ctx = JS_NewContext(rt);
+    ret = eval(ctx, setup_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    global_object = JS_GetGlobalObject(ctx);
+    alive = JS_GetPropertyStr(ctx, global_object, "alive");
+    size = JS_NewInt32(ctx, 100000);
+    /* an unreachable cycle is still there after an allocation failed at the GC threshold */
+    for (i = 0; i < (int)countof(names); i++) {
+        func = JS_GetPropertyStr(ctx, global_object, names[i]);
+        assert(JS_IsFunction(ctx, func));
+        JS_SetGCThreshold(rt, 0);
+        JS_SetMemoryLimit(rt, 1);
+        ret = JS_Call(ctx, func, JS_UNDEFINED, 1, (JSValueConst *)&size);
+        JS_SetMemoryLimit(rt, 0);
+        JS_SetGCThreshold(rt, (size_t)-1);
+        if (i == 0)
+            assert(JS_IsException(ret));
+        if (JS_HasException(ctx))
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, func);
+        ret = JS_Call(ctx, alive, JS_UNDEFINED, 0, NULL);
+        assert(JS_ToBool(ctx, ret) == 1);
+    }
+    JS_FreeValue(ctx, alive);
+    JS_FreeValue(ctx, global_object);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void resolver_allocation_failure(void)
 {
     static const char *const uses[] = {
@@ -3382,6 +3435,7 @@ int main(void)
     uncatchable_interrupt_at_memory_limit();
     uncatchable_out_of_memory();
     shape_resize_allocation_failure();
+    out_of_memory_exception_runs_no_gc();
     parser_scope_out_of_memory();
     parser_label_out_of_memory();
     await_using_outside_async();
