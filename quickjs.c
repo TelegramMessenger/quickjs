@@ -6235,11 +6235,12 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
     } else {
         /* only resize the properties */
         list_del(&sh->header.link);
-        sh_alloc = js_realloc(ctx, get_alloc_from_shape(sh),
-                              get_shape_size(new_hash_size, new_size));
+        sh_alloc = js_realloc_rt(ctx->rt, get_alloc_from_shape(sh),
+                                 get_shape_size(new_hash_size, new_size));
         if (unlikely(!sh_alloc)) {
             /* insert again in the GC list */
             list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
+            JS_ThrowOutOfMemory(ctx);
             return -1;
         }
         sh = get_shape_from_alloc(sh_alloc, new_hash_size);

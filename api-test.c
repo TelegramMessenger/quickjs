@@ -2971,6 +2971,86 @@ static void parser_allocation_failure(void)
         compile_with_alloc_failure(module, JS_EVAL_TYPE_MODULE, n);
 }
 
+static JSRuntime *alloc_failure_gc_rt;
+
+static void *alloc_failure_gc(void *ptr)
+{
+    if (!ptr && alloc_failure.armed && alloc_failure_gc_rt)
+        JS_SetGCThreshold(alloc_failure_gc_rt, 0);
+    return ptr;
+}
+
+static void *alloc_failure_gc_calloc(void *opaque, size_t count, size_t size)
+{
+    return alloc_failure_gc(alloc_failure_calloc(opaque, count, size));
+}
+
+static void *alloc_failure_gc_malloc(void *opaque, size_t size)
+{
+    return alloc_failure_gc(alloc_failure_malloc(opaque, size));
+}
+
+static void *alloc_failure_gc_realloc(void *opaque, void *ptr, size_t size)
+{
+    void *ret = alloc_failure_realloc(opaque, ptr, size);
+
+    return size ? alloc_failure_gc(ret) : ret;
+}
+
+static long run_with_alloc_failure(const char *src, long fail_at, bool collect)
+{
+    static const JSMallocFunctions mf = {
+        alloc_failure_gc_calloc,
+        alloc_failure_gc_malloc,
+        alloc_failure_free,
+        alloc_failure_gc_realloc,
+        alloc_failure_usable_size,
+    };
+    JSRuntime *rt = JS_NewRuntime2(&mf, NULL);
+    JSContext *ctx = JS_NewContext(rt);
+    JSContext *job_ctx;
+    JSValue ret;
+    long requests;
+    int r;
+
+    alloc_failure.requests = 0;
+    alloc_failure.fail_at = fail_at;
+    alloc_failure_gc_rt = collect ? rt : NULL;
+    alloc_failure.armed = true;
+    ret = JS_Eval(ctx, src, strlen(src), "<alloc>", JS_EVAL_TYPE_GLOBAL);
+    if (!fail_at)
+        assert(!JS_IsException(ret));
+    if (JS_IsException(ret))
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, ret);
+    while ((r = JS_ExecutePendingJob(rt, &job_ctx)) != 0) {
+        if (r < 0)
+            JS_FreeValue(job_ctx, JS_GetException(job_ctx));
+    }
+    alloc_failure.armed = false;
+    alloc_failure_gc_rt = NULL;
+    requests = alloc_failure.requests;
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return requests;
+}
+
+static void run_alloc_failure_sweep(const char *src, bool collect)
+{
+    long n, requests;
+
+    requests = run_with_alloc_failure(src, 0, collect);
+    assert(requests > 0);
+    for (n = 1; n <= requests; n++)
+        run_with_alloc_failure(src, n, collect);
+}
+
+static void shape_resize_allocation_failure(void)
+{
+    run_alloc_failure_sweep("var o = {}; for (var i = 0; i < 100; i++) o[i] = i;",
+                            true);
+}
+
 static void resolver_allocation_failure(void)
 {
     static const char *const uses[] = {
@@ -3301,6 +3381,7 @@ int main(void)
     uncatchable_interrupt_sites();
     uncatchable_interrupt_at_memory_limit();
     uncatchable_out_of_memory();
+    shape_resize_allocation_failure();
     parser_scope_out_of_memory();
     parser_label_out_of_memory();
     await_using_outside_async();
