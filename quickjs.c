@@ -22507,6 +22507,7 @@ typedef struct JSAsyncGeneratorRequest {
 typedef struct JSAsyncGeneratorData {
     JSObject *generator; /* back pointer to the object (const) */
     JSAsyncGeneratorStateEnum state;
+    bool return_registered; /* AWAITING_RETURN: the reactions of the awaited value are registered */
     JSAsyncFunctionState func_state;
     struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
 } JSAsyncGeneratorData;
@@ -22711,6 +22712,7 @@ static int js_async_generator_completed_return(JSContext *ctx,
     JS_FreeValue(ctx, resolving_funcs1[0]);
     JS_FreeValue(ctx, resolving_funcs1[1]);
     JS_FreeValue(ctx, promise);
+    s->return_registered = !res;
     return res;
 }
 
@@ -22843,8 +22845,10 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
 
     if (magic >= 2) {
         /* resume next case in AWAITING_RETURN state */
-        assert(s->state == JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN ||
-               s->state == JS_ASYNC_GENERATOR_STATE_COMPLETED);
+        if (s->state != JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN ||
+            !s->return_registered)
+            return JS_UNDEFINED;
+        s->return_registered = false;
         s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
         if (is_reject) {
             js_async_generator_reject(ctx, s, arg);
@@ -33081,12 +33085,8 @@ static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst t
     if (js_check_stack_overflow(ctx->rt, 0))
         return JS_ThrowStackOverflow(ctx);
 
-    if (module->status == JS_MODULE_STATUS_EVALUATED) {
-        assert(module->eval_has_exception);
+    if (module->status != JS_MODULE_STATUS_EVALUATING_ASYNC)
         return JS_UNDEFINED;
-    }
-
-    assert(module->status == JS_MODULE_STATUS_EVALUATING_ASYNC);
     assert(!module->eval_has_exception);
     assert(module->async_evaluation);
 
@@ -33120,11 +33120,8 @@ static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst 
     ExecModuleList exec_list_s, *exec_list = &exec_list_s;
     int i;
 
-    if (module->status == JS_MODULE_STATUS_EVALUATED) {
-        assert(module->eval_has_exception);
+    if (module->status != JS_MODULE_STATUS_EVALUATING_ASYNC)
         return JS_UNDEFINED;
-    }
-    assert(module->status == JS_MODULE_STATUS_EVALUATING_ASYNC);
     assert(!module->eval_has_exception);
     assert(module->async_evaluation);
     module->async_evaluation = false;
@@ -64917,7 +64914,11 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
     JSObject *p;
 
     csd->constructor = sf->is_constructor;
-    csd->func = js_dup(sf->cur_func);
+    /* a closure of the engine (the continuation of an await) is not handed to script */
+    if (JS_VALUE_GET_OBJ(sf->cur_func)->class_id == JS_CLASS_C_FUNCTION_DATA)
+        csd->func = JS_UNDEFINED;
+    else
+        csd->func = js_dup(sf->cur_func);
     /* func_name_str is UTF-8 encoded if needed */
     func_name_str = get_func_name(ctx, sf->cur_func);
     if (!func_name_str || func_name_str[0] == '\0')
