@@ -2838,6 +2838,85 @@ static void array_length_oom(void)
     JS_FreeRuntime(rt);
 }
 
+static long eval_with_alloc_failure(const char *src, long fail_at)
+{
+    static const JSMallocFunctions mf = {
+        alloc_failure_calloc,
+        alloc_failure_malloc,
+        alloc_failure_free,
+        alloc_failure_realloc,
+        alloc_failure_usable_size,
+    };
+    JSRuntime *rt = JS_NewRuntime2(&mf, NULL);
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue ret, e;
+    const char *str;
+    long requests;
+
+    alloc_failure.requests = 0;
+    alloc_failure.fail_at = fail_at;
+    alloc_failure.armed = true;
+    ret = JS_Eval(ctx, src, strlen(src), "<alloc>", JS_EVAL_TYPE_GLOBAL);
+    alloc_failure.armed = false;
+    requests = alloc_failure.requests;
+    if (JS_IsException(ret)) {
+        assert(fail_at);
+        e = JS_GetException(ctx);
+        assert(JS_IsError(e));
+        assert(JS_IsUncatchableError(e));
+        JS_FreeValue(ctx, e);
+    } else {
+        str = JS_ToCString(ctx, ret);
+        assert(str);
+        assert(!strcmp(str, "none"));
+        JS_FreeCString(ctx, str);
+    }
+    JS_FreeValue(ctx, ret);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return requests;
+}
+
+static void atom_allocation_failure(void)
+{
+    static const char script[] =
+        "var caught = 'none';\n"
+        "try {\n"
+        "    var keep = [];\n"
+        "    for (var i = 0; i < 4000; i++) {\n"
+        "        var o = {};\n"
+        "        o['k' + i] = i;\n"
+        "        keep.push(o);\n"
+        "    }\n"
+        "} catch (e) {\n"
+        "    caught = typeof e;\n"
+        "}\n"
+        "caught;\n";
+    enum { count = 3000 };
+    char *src, *p;
+    long n, requests;
+    int i;
+
+    requests = eval_with_alloc_failure(script, 0);
+    for (n = 1; n <= requests; n++)
+        eval_with_alloc_failure(script, n);
+
+    src = malloc(count * 24 + 64);
+    assert(src);
+    p = src;
+    p += sprintf(p, "var ");
+    for (i = 0; i < count; i++)
+        p += sprintf(p, "v%d,", i);
+    p += sprintf(p, "v;\nvar a = [");
+    for (i = 0; i < count; i++)
+        p += sprintf(p, "'s%d',", i);
+    sprintf(p, "];\n'none';\n");
+    requests = eval_with_alloc_failure(src, 0);
+    for (n = 1; n <= requests; n++)
+        eval_with_alloc_failure(src, n);
+    free(src);
+}
+
 static void parser_allocation_failure(void)
 {
     static const char script[] =
@@ -3218,6 +3297,7 @@ int main(void)
     std_eval_interrupt_handler();
     slice_atom_releases_parent();
     array_length_oom();
+    atom_allocation_failure();
     uncatchable_interrupt_sites();
     uncatchable_interrupt_at_memory_limit();
     uncatchable_out_of_memory();

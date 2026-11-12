@@ -3967,6 +3967,7 @@ static void __JS_FreeAtom(JSRuntime *rt, uint32_t i)
 static JSAtom JS_NewAtomStr(JSContext *ctx, JSString *p)
 {
     JSRuntime *rt = ctx->rt;
+    JSAtom atom;
     uint32_t n;
     if (is_num_string(&n, p)) {
         if (n <= JS_ATOM_MAX_INT) {
@@ -3974,8 +3975,10 @@ static JSAtom JS_NewAtomStr(JSContext *ctx, JSString *p)
             return __JS_AtomFromUInt32(n);
         }
     }
-    /* XXX: should generate an exception */
-    return __JS_NewAtom(rt, p, JS_ATOM_TYPE_STRING);
+    atom = __JS_NewAtom(rt, p, JS_ATOM_TYPE_STRING);
+    if (unlikely(atom == JS_ATOM_NULL))
+        JS_ThrowOutOfMemory(ctx);
+    return atom;
 }
 
 /* `str` may be pure ASCII or UTF-8 encoded */
@@ -4012,8 +4015,7 @@ JSAtom JS_NewAtomUInt32(JSContext *ctx, uint32_t n)
         JSValue val = js_new_string8_len(ctx, buf, len);
         if (JS_IsException(val))
             return JS_ATOM_NULL;
-        return __JS_NewAtom(ctx->rt, JS_VALUE_GET_STRING(val),
-                            JS_ATOM_TYPE_STRING);
+        return JS_NewAtomStr(ctx, JS_VALUE_GET_STRING(val));
     }
 }
 
@@ -4027,8 +4029,7 @@ static JSAtom JS_NewAtomInt64(JSContext *ctx, int64_t n)
         JSValue val = js_new_string8_len(ctx, buf, len);
         if (JS_IsException(val))
             return JS_ATOM_NULL;
-        return __JS_NewAtom(ctx->rt, JS_VALUE_GET_STRING(val),
-                            JS_ATOM_TYPE_STRING);
+        return JS_NewAtomStr(ctx, JS_VALUE_GET_STRING(val));
     }
 }
 
@@ -10887,6 +10888,8 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
                 /* faster to iterate */
                 while (cur_len > len) {
                     atom = JS_NewAtomUInt32(ctx, cur_len - 1);
+                    if (unlikely(atom == JS_ATOM_NULL))
+                        return -1;
                     ret = delete_property(ctx, p, atom);
                     JS_FreeAtom(ctx, atom);
                     if (unlikely(!ret)) {
@@ -25001,7 +25004,9 @@ static __exception int emit_push_const(JSParseState *s, JSValue val,
         /* warning: JS_NewAtomStr frees the string value */
         js_dup(val);
         atom = JS_NewAtomStr(s->ctx, JS_VALUE_GET_STRING(val));
-        if (atom != JS_ATOM_NULL && !__JS_AtomIsTaggedInt(atom)) {
+        if (atom == JS_ATOM_NULL)
+            return -1;
+        if (!__JS_AtomIsTaggedInt(atom)) {
             emit_op(s, OP_push_atom_value);
             emit_u32(s, atom);
             return 0;
@@ -33868,6 +33873,8 @@ static __exception int js_parse_source_element(JSParseState *s)
     return 0;
 }
 
+static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd);
+
 /* `filename` may be pure ASCII or UTF-8 encoded */
 static JSFunctionDef *js_new_function_def(JSContext *ctx,
                                           JSFunctionDef *parent,
@@ -33933,6 +33940,10 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     //fd->pc2line_last_line_num = line_num;
     //fd->pc2line_last_pc = 0;
 
+    if (fd->filename == JS_ATOM_NULL) {
+        js_free_function_def(ctx, fd);
+        return NULL;
+    }
     return fd;
 }
 
