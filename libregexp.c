@@ -2041,9 +2041,10 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
                     return re_parse_error(s, "duplicate group name");
                 }
                 /* group name with a trailing zero */
-                dbuf_put(&s->group_names, (uint8_t *)s->u.tmp_buf,
-                         strlen(s->u.tmp_buf) + 1);
-                dbuf_putc(&s->group_names, s->group_name_scope);
+                if (dbuf_put(&s->group_names, (uint8_t *)s->u.tmp_buf,
+                             strlen(s->u.tmp_buf) + 1) ||
+                    dbuf_putc(&s->group_names, s->group_name_scope))
+                    return re_parse_out_of_memory(s);
                 s->has_named_captures = 1;
                 goto parse_capture;
             } else {
@@ -2053,8 +2054,9 @@ static int re_parse_term(REParseState *s, bool is_backward_dir)
             int capture_index;
             p++;
             /* capture without group name */
-            dbuf_putc(&s->group_names, 0);
-            dbuf_putc(&s->group_names, 0);
+            if (dbuf_putc(&s->group_names, 0) ||
+                dbuf_putc(&s->group_names, 0))
+                return re_parse_out_of_memory(s);
         parse_capture:
             if (s->capture_count >= CAPTURE_COUNT_MAX)
                 return re_parse_error(s, "too many captures");
@@ -2635,7 +2637,7 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
         goto error;
     }
 
-    if (dbuf_error(&s->byte_code)) {
+    if (dbuf_error(&s->byte_code) || dbuf_error(&s->group_names)) {
         re_parse_out_of_memory(s);
         goto error;
     }

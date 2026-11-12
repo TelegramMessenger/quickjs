@@ -23345,6 +23345,8 @@ int JS_PRINTF_FORMAT_ATTR(2, 3) js_parse_error(JSParseState *s, JS_PRINTF_FORMAT
     va_list ap;
     int backtrace_flags;
 
+    if (unlikely(js_uncatchable_pending(ctx)) && JS_HasException(ctx))
+        return -1;
     va_start(ap, fmt);
     JS_ThrowError2(ctx, JS_SYNTAX_ERROR, false, fmt, ap);
     va_end(ap);
@@ -23864,6 +23866,10 @@ static __exception int next_token(JSParseState *s)
 
     if (js_check_stack_overflow(s->ctx->rt, 1000)) {
         JS_ThrowStackOverflow(s->ctx);
+        return -1;
+    }
+    if (unlikely(s->cur_func && dbuf_error(&s->cur_func->byte_code))) {
+        JS_ThrowOutOfMemory(s->ctx);
         return -1;
     }
 
@@ -24917,8 +24923,10 @@ static int cpool_add(JSParseState *s, JSValue val)
     JSFunctionDef *fd = s->cur_func;
 
     if (js_resize_array(s->ctx, (void *)&fd->cpool, sizeof(fd->cpool[0]),
-                        &fd->cpool_size, fd->cpool_count + 1))
+                        &fd->cpool_size, fd->cpool_count + 1)) {
+        dbuf_set_error(&fd->byte_code);
         return -1;
+    }
     fd->cpool[fd->cpool_count++] = val;
     return fd->cpool_count - 1;
 }
@@ -26258,7 +26266,7 @@ static __exception int emit_class_init_start(JSParseState *s,
     return 0;
 }
 
-static void emit_class_init_end(JSParseState *s, ClassFieldsDef *cf)
+static __exception int emit_class_init_end(JSParseState *s, ClassFieldsDef *cf)
 {
     int cpool_idx;
 
@@ -26268,9 +26276,12 @@ static void emit_class_init_end(JSParseState *s, ClassFieldsDef *cf)
 
     cpool_idx = cpool_add(s, JS_NULL);
     cf->fields_init_fd->parent_cpool_idx = cpool_idx;
+    if (cpool_idx < 0)
+        return -1;
     emit_op(s, OP_fclosure);
     emit_u32(s, cpool_idx);
     emit_op(s, OP_set_home_object);
+    return 0;
 }
 
 static void emit_return(JSParseState *s, bool hasval);
@@ -26338,6 +26349,8 @@ static __exception int js_parse_class_default_ctor(JSParseState *s,
     /* the real object will be set at the end of the compilation */
     idx = cpool_add(s, JS_NULL);
     fd->parent_cpool_idx = idx;
+    if (idx < 0)
+        return -1;
 
     return 0;
 }
@@ -26754,6 +26767,8 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             goto fail;
     }
     /* patch the constant pool index for the constructor */
+    if (dbuf_error(&fd->byte_code))
+        goto fail;
     put_u32(fd->byte_code.buf + ctor_cpool_offset, ctor_fd->parent_cpool_idx);
 
     /* store the class source code in the constructor. */
@@ -26785,6 +26800,8 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             }
             /* patch the start of the function to enable the
                OP_add_brand_instance code */
+            if (dbuf_error(&cf->fields_init_fd->byte_code))
+                goto fail;
             cf->fields_init_fd->byte_code.buf[cf->brand_push_pos] = OP_push_true;
         }
 
@@ -26795,7 +26812,8 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
         if (var_idx < 0)
             goto fail;
         if (cf->fields_init_fd) {
-            emit_class_init_end(s, cf);
+            if (emit_class_init_end(s, cf))
+                goto fail;
         } else {
             emit_op(s, OP_undefined);
         }
@@ -26818,7 +26836,8 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
     if (class_fields[1].fields_init_fd != NULL) {
         ClassFieldsDef *cf = &class_fields[1];
         emit_op(s, OP_dup);
-        emit_class_init_end(s, cf);
+        if (emit_class_init_end(s, cf))
+            goto fail;
         emit_op(s, OP_call_method);
         emit_u16(s, 0);
         emit_op(s, OP_drop);
@@ -27826,6 +27845,8 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
             return -1;
         }
         /* remove test and decrement label ref count */
+        if (dbuf_error(&s->cur_func->byte_code))
+            return -1;
         memset(s->cur_func->byte_code.buf + start_addr, OP_nop,
                assign_addr - start_addr);
         s->cur_func->label_slots[label_parse].ref_count--;
@@ -30056,7 +30077,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
         int chunk_size = pos_expr - pos_next;
         int offset = bc->size - pos_next;
         int i;
-        if (dbuf_claim(bc, chunk_size))
+        if (dbuf_error(bc) || dbuf_claim(bc, chunk_size))
             return -1;
         dbuf_put(bc, bc->buf + pos_next, chunk_size);
         memset(bc->buf + pos_next, OP_nop, chunk_size);
@@ -30580,7 +30601,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 int chunk_size = pos_body - pos_cont;
                 int offset = bc->size - pos_cont;
                 int i;
-                if (dbuf_claim(bc, chunk_size))
+                if (dbuf_error(bc) || dbuf_claim(bc, chunk_size))
                     return -1;
                 dbuf_put(bc, bc->buf + pos_cont, chunk_size);
                 memset(bc->buf + pos_cont, OP_nop, chunk_size);
@@ -30760,6 +30781,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 goto fail;
             if (default_label_pos >= 0) {
                 /* Ugly patch for the `default` label, shameful and risky */
+                if (dbuf_error(&s->cur_func->byte_code))
+                    goto fail;
                 put_u32(s->cur_func->byte_code.buf + default_label_pos,
                         label_case);
                 s->cur_func->label_slots[label_case].pos = default_label_pos + 4;
@@ -36732,6 +36755,8 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 
     for (pos = 0; pos < bc_len; pos = pos_next) {
         int val;
+        if (unlikely(dbuf_error(&bc_out)))
+            goto fail;
         op = bc_buf[pos];
         len = opcode_info[op].size;
         pos_next = pos + len;
@@ -37465,6 +37490,9 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         }
     }
 
+    if (unlikely(dbuf_error(&bc_out)))
+        goto fail;
+
     /* check that there were no missing labels */
     for(i = 0; i < s->label_count; i++) {
         assert(label_slots[i].first_reloc == NULL);
@@ -37563,8 +37591,16 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     }
     return 0;
  fail:
-    /* XXX: not safe */
+    for (i = 0; i < s->label_count; i++) {
+        for (re = label_slots[i].first_reloc; re != NULL; re = re_next) {
+            re_next = re->next;
+            js_free(ctx, re);
+        }
+        label_slots[i].first_reloc = NULL;
+    }
+    /* the atoms are split between the two buffers by now: drop both unwalked rather than free some twice */
     dbuf_free(&bc_out);
+    dbuf_free(&s->byte_code);
     return -1;
 }
 
@@ -37865,6 +37901,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     int function_size, byte_code_offset, cpool_offset;
     int closure_var_offset, vardefs_offset;
 
+    if (dbuf_error(&fd->byte_code))
+        goto fail_oom;
+
     /* recompute scope linkage */
     for (scope = 0; scope < fd->scope_count; scope++) {
         fd->scopes[scope].first = -1;
@@ -37919,9 +37958,15 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         if (JS_IsException(func_obj))
             goto fail;
         /* save it in the constant pool */
-        assert(cpool_idx >= 0);
+        if (cpool_idx < 0 || cpool_idx >= fd->cpool_count) {
+            JS_FreeValue(ctx, func_obj);
+            goto fail_oom;
+        }
         fd->cpool[cpool_idx] = func_obj;
     }
+
+    if (dbuf_error(&fd->byte_code))
+        goto fail_oom;
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_PASS1
     if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_PASS1)) {
@@ -38073,6 +38118,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 
     js_free(ctx, fd);
     return JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
+ fail_oom:
+    JS_ThrowOutOfMemory(ctx);
  fail:
     js_free_function_def(ctx, fd);
     return JS_EXCEPTION;
@@ -38797,6 +38844,8 @@ done:
         /* the real object will be set at the end of the compilation */
         idx = cpool_add(s, JS_NULL);
         fd->parent_cpool_idx = idx;
+        if (idx < 0)
+            goto fail;
 
         if (is_expr) {
             /* for constructors, no code needs to be generated here */
@@ -39166,6 +39215,12 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     fun_obj = js_create_function(ctx, fd);
     if (JS_IsException(fun_obj))
         goto fail1;
+    if (unlikely(js_uncatchable_pending(ctx))) {
+        JS_FreeValue(ctx, fun_obj);
+        if (!JS_HasException(ctx))
+            JS_ThrowOutOfMemory(ctx);
+        goto fail1;
+    }
     /* Could add a flag to avoid resolution if necessary */
     if (m) {
         m->func_obj = fun_obj;

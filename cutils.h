@@ -521,6 +521,7 @@ static inline bool dbuf_error(DynBuf *s) {
 static inline void dbuf_set_error(DynBuf *s)
 {
     s->error = true;
+    s->allocated_size = s->size; /* no room left: later writes fail too, the contents stay a prefix */
 }
 
 /*---- UTF-8 and UTF-16 handling ----*/
@@ -801,7 +802,7 @@ static inline int dbuf_claim(DynBuf *s, size_t len)
             new_allocated_size = size;
         new_buf = s->realloc_func(s->opaque, s->buf, new_allocated_size);
         if (!new_buf) {
-            s->error = true;
+            dbuf_set_error(s);
             return -1;
         }
         s->buf = new_buf;

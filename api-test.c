@@ -2675,6 +2675,157 @@ static void parser_label_out_of_memory(void)
     assert(oom_seen);
 }
 
+typedef struct {
+    size_t size;
+    size_t reserved;
+} AllocFailureHeader;
+
+static struct {
+    bool armed;
+    long requests;
+    long fail_at;
+} alloc_failure;
+
+static bool alloc_failure_hits(void)
+{
+    return alloc_failure.armed &&
+        ++alloc_failure.requests == alloc_failure.fail_at;
+}
+
+static void *alloc_failure_malloc(void *opaque, size_t size)
+{
+    AllocFailureHeader *h;
+
+    if (alloc_failure_hits())
+        return NULL;
+    h = malloc(sizeof(*h) + size);
+    if (!h)
+        return NULL;
+    h->size = size;
+    return h + 1;
+}
+
+static void *alloc_failure_calloc(void *opaque, size_t count, size_t size)
+{
+    void *ptr = alloc_failure_malloc(opaque, count * size);
+
+    if (ptr)
+        memset(ptr, 0, count * size);
+    return ptr;
+}
+
+static void alloc_failure_free(void *opaque, void *ptr)
+{
+    if (ptr)
+        free((AllocFailureHeader *)ptr - 1);
+}
+
+static void *alloc_failure_realloc(void *opaque, void *ptr, size_t size)
+{
+    AllocFailureHeader *h = ptr ? (AllocFailureHeader *)ptr - 1 : NULL;
+
+    if ((!h || size > h->size) && alloc_failure_hits())
+        return NULL;
+    h = realloc(h, sizeof(*h) + size);
+    if (!h)
+        return NULL;
+    h->size = size;
+    return h + 1;
+}
+
+static size_t alloc_failure_usable_size(const void *ptr)
+{
+    return ptr ? ((const AllocFailureHeader *)ptr - 1)->size : 0;
+}
+
+static long compile_with_alloc_failure(const char *src, int eval_type,
+                                       long fail_at)
+{
+    static const JSMallocFunctions mf = {
+        alloc_failure_calloc,
+        alloc_failure_malloc,
+        alloc_failure_free,
+        alloc_failure_realloc,
+        alloc_failure_usable_size,
+    };
+    JSRuntime *rt = JS_NewRuntime2(&mf, NULL);
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue ret;
+    long requests;
+
+    alloc_failure.requests = 0;
+    alloc_failure.fail_at = fail_at;
+    alloc_failure.armed = true;
+    ret = JS_Eval(ctx, src, strlen(src), "<alloc>",
+                  eval_type | JS_EVAL_FLAG_COMPILE_ONLY);
+    alloc_failure.armed = false;
+    requests = alloc_failure.requests;
+    if (!fail_at)
+        assert(!JS_IsException(ret));
+    if (!JS_IsException(ret) && eval_type == JS_EVAL_TYPE_GLOBAL)
+        ret = JS_EvalFunction(ctx, ret);
+    if (JS_IsException(ret))
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, ret);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return requests;
+}
+
+static void parser_allocation_failure(void)
+{
+    static const char script[] =
+        "var out = [];\n"
+        "function unit(a) {\n"
+        "  let b = a + 1, j = 0;\n"
+        "  { let c = a * 2; { const d = c + b; out.push(d); } }\n"
+        "  for (let i = 0; i < 2; i++) { let g = i; out.push(() => g + b); }\n"
+        "  for (const k in {x: 1}) { out.push(k); }\n"
+        "  for (const [p, q = 3] of [[1]]) { out.push(p + q); }\n"
+        "  outer: for (let x = 0; x < 2; x++) {\n"
+        "    for (let y = 0; y < 2; y++) { if (y) continue outer; out.push(x); }\n"
+        "  }\n"
+        "  switch (a) { default: out.push(9); case 0: { let s = 0; out.push(s); }\n"
+        "    break; case 1: out.push(1); }\n"
+        "  try { throw new Error('e'); } catch ({message}) { out.push(message); }\n"
+        "  finally { out.push(3); }\n"
+        "  with ({w: 7}) { out.push(w); }\n"
+        "  class Base { #p = 1; static s = 2; f = 3; get p() { return this.#p; }\n"
+        "    static { Base.t = 5; } m() { return super.toString; } }\n"
+        "  class Derived extends Base { m(...r) { return r.length + this.p; } }\n"
+        "  out.push(new Derived().m(1, 2), Base.t);\n"
+        "  const o = { a, ['k' + a]: 1, get g() { return 1; }, ...{sp: 1} };\n"
+        "  let { a: d0, ...rest } = o; [d0, j] = [j, d0];\n"
+        "  out.push(`t${a}u${b}`, /(?<y>\\d+)-(?<m>\\d+)/.exec('1-2').groups.m,\n"
+        "           o?.g?.x, a ?? b, 2 ** 3, rest.sp);\n"
+        "  { using r = { [Symbol.dispose]() { out.push('d'); } }; }\n"
+        "  out.push(eval('let ev = a + 1; ev'), 1.5, 2.5, 'str',\n"
+        "           function () { return a; }());\n"
+        "  function* gen() { yield* [1, 2]; }\n"
+        "  async function af() { await 0; for await (const v of []) {} }\n"
+        "  out.push([...gen()].length, typeof af);\n"
+        "  return out.length;\n"
+        "}\n"
+        "unit(0) + unit(1);\n";
+    static const char module[] =
+        "export const c = 1;\n"
+        "export function f(x = 1, ...r) { return x + r.length; }\n"
+        "export default class { static #p = 1; static p() { return this.#p; } }\n"
+        "const t = await 0;\n"
+        "for (const z of [t]) { let q = z; }\n"
+        "export { t as u };\n";
+    long n, requests;
+
+    requests = compile_with_alloc_failure(script, JS_EVAL_TYPE_GLOBAL, 0);
+    assert(requests > 0);
+    for (n = 1; n <= requests; n++)
+        compile_with_alloc_failure(script, JS_EVAL_TYPE_GLOBAL, n);
+    requests = compile_with_alloc_failure(module, JS_EVAL_TYPE_MODULE, 0);
+    assert(requests > 0);
+    for (n = 1; n <= requests; n++)
+        compile_with_alloc_failure(module, JS_EVAL_TYPE_MODULE, n);
+}
+
 int main(void)
 {
     cfunctions();
@@ -2721,6 +2872,7 @@ int main(void)
     parser_scope_out_of_memory();
     parser_label_out_of_memory();
     await_using_outside_async();
+    parser_allocation_failure();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();
