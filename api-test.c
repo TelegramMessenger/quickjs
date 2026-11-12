@@ -3474,6 +3474,63 @@ static void resolver_allocation_failure(void)
     }
 }
 
+static void module_function_normal_call(void)
+{
+    static const char *const bodies[] = {
+        "    {\n"
+        "        let x = 0x1234;\n"
+        "        globalThis.get = () => x;\n"
+        "        await 0;\n"
+        "    }\n",
+        "    globalThis.get = () => this === null ? 0x1234 : 0;\n",
+    };
+    char code[1024];
+    size_t i;
+
+    for (i = 0; i < countof(bodies); i++) {
+        JSRuntime *rt = JS_NewRuntime();
+        JSContext *ctx = JS_NewContext(rt);
+        JSValue ret, e, global, get, val;
+        const char *str;
+        int32_t x = 0;
+
+        snprintf(code, sizeof(code),
+                 "Error.prepareStackTrace = (e, sites) => sites;\n"
+                 "const self = new Error().stack[0].getFunction();\n"
+                 "Error.prepareStackTrace = undefined;\n"
+                 "if (typeof self !== 'function') {\n"
+                 "} else if (!globalThis.again) {\n"
+                 "    globalThis.again = true;\n"
+                 "    self.call(null);\n"
+                 "} else {\n"
+                 "%s"
+                 "}\n", bodies[i]);
+        ret = JS_Eval(ctx, code, strlen(code), "<module>", JS_EVAL_TYPE_MODULE);
+        JS_FreeValue(ctx, ret);
+        e = JS_GetException(ctx);
+        global = JS_GetGlobalObject(ctx);
+        get = JS_GetPropertyStr(ctx, global, "get");
+        /* nothing to reach when the engine does not hand the function of a module out */
+        if (!JS_IsUndefined(get)) {
+            assert(JS_IsError(e));
+            str = JS_ToCString(ctx, e);
+            assert(str != NULL);
+            assert(strstr(str, "suspending opcode") != NULL);
+            JS_FreeCString(ctx, str);
+            val = JS_Call(ctx, get, JS_UNDEFINED, 0, NULL);
+            assert(!JS_IsException(val));
+            assert(JS_ToInt32(ctx, &x, val) == 0);
+            assert(x == 0x1234);
+            JS_FreeValue(ctx, val);
+        }
+        JS_FreeValue(ctx, get);
+        JS_FreeValue(ctx, global);
+        JS_FreeValue(ctx, e);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+    }
+}
+
 static void regexp_allocation_failure(void)
 {
     char src[2048], filler[400];
@@ -3802,6 +3859,7 @@ int main(void)
     exception_value_not_stored();
     private_symbols();
     new_context_low_memory();
+    module_function_normal_call();
     json_stringify_oom();
     return 0;
 }

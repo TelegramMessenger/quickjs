@@ -21700,13 +21700,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_initial_yield):
             ret_val = JS_UNDEFINED;
         generator_exit:
-            /* These opcodes suspend the frame, which only a generator or an
-               async function can do: their frame outlives the call. A normal
-               function's frame is on the C stack, and leaving it through
-               done_generator would skip close_var_refs(), so closures would
-               keep references into a frame that no longer exists. The parser
-               never emits them there; refuse it if bytecode ever does. */
-            if (unlikely(b->func_kind == JS_FUNC_NORMAL)) {
+            /* only a coroutine frame outlives the call; one on the C stack must leave through done */
+            if (unlikely(sf == &sf_s)) {
                 JS_ThrowInternalError(ctx, "suspending opcode in a normal function");
                 goto exception;
             }
@@ -21804,7 +21799,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* the local variables are freed by the caller in the generator
        case. Hence the label 'done' should never be reached in a
        generator function. */
-    if (b->func_kind != JS_FUNC_NORMAL) {
+    if (sf != &sf_s) {
     done_generator:
         sf->cur_pc = pc;
         sf->cur_sp = sp;
