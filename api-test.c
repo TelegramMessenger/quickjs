@@ -3402,6 +3402,32 @@ static void set_prototype_out_of_memory(void)
     assert(failed && done);
 }
 
+static void promise_combinator_out_of_memory(void)
+{
+    static const char setup[] =
+        "var items = [];\n"
+        "for (var i = 0; i < 64; i++) items.push(Promise.resolve(i));\n"
+        "function f(name) { Promise[name](items); }\n";
+    static const struct {
+        const char *name;
+        size_t step;
+    } cases[] = { { "allSettled", 192 }, { "any", 48 } };
+    size_t headroom, k;
+    bool done, failed;
+
+    /* allSettled can fail at every element, any only where its array of errors grows */
+    for (k = 0; k < countof(cases); k++) {
+        done = failed = false;
+        for (headroom = 0; headroom < 64 * 1024; headroom += cases[k].step) {
+            if (call_at_memory_limit(setup, cases[k].name, headroom))
+                failed = true;
+            else
+                done = true;
+        }
+        assert(failed && done);
+    }
+}
+
 static void resolver_allocation_failure(void)
 {
     static const char *const uses[] = {
@@ -3741,6 +3767,7 @@ int main(void)
     weak_map_symbol_key_teardown();
     lazy_builtin_out_of_memory();
     set_prototype_out_of_memory();
+    promise_combinator_out_of_memory();
     parser_scope_out_of_memory();
     parser_label_out_of_memory();
     await_using_outside_async();
