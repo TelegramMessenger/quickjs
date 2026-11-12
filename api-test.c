@@ -418,7 +418,6 @@ static void module_serde(void)
     assert(JS_IsUndefined(result));
     JS_FreeValue(ctx, result);
     JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, mod);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 }
@@ -3204,6 +3203,51 @@ static void finalization_registry_job_oom(void)
     JS_FreeRuntime(rt);
 }
 
+static void module_value_outlives_context(void)
+{
+    static const char code[] = "export const x = 1;\n";
+    JSMemoryUsage before, after;
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue mod, ret;
+
+    mod = JS_Eval(ctx, code, strlen(code), "m",
+                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(JS_IsModule(mod));
+    ret = JS_EvalFunction(ctx, JS_DupValue(ctx, mod));
+    assert(JS_IsPromise(ret));
+    JS_FreeValue(ctx, ret);
+    JS_FreeContext(ctx);
+    JS_RunGC(rt);
+    /* the context is gone: the last reference releases the module definition */
+    JS_ComputeMemoryUsage(rt, &before);
+    JS_FreeValueRT(rt, mod);
+    JS_ComputeMemoryUsage(rt, &after);
+    assert(after.malloc_count == before.malloc_count - 1);
+    JS_FreeRuntime(rt);
+}
+
+static void module_pending_await(void)
+{
+    static const char code[] =
+        "globalThis.self = import('pending');\n"
+        "globalThis.never = new Promise(() => {});\n"
+        "await globalThis.never;\n";
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSContext *job_ctx;
+    JSValue ret;
+
+    ret = JS_Eval(ctx, code, strlen(code), "pending", JS_EVAL_TYPE_MODULE);
+    assert(JS_IsPromise(ret));
+    assert(JS_PROMISE_PENDING == JS_PromiseState(ctx, ret));
+    JS_FreeValue(ctx, ret);
+    while (JS_ExecutePendingJob(rt, &job_ctx) > 0)
+        ;
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void resolver_allocation_failure(void)
 {
     static const char *const uses[] = {
@@ -3538,6 +3582,8 @@ int main(void)
     out_of_memory_exception_runs_no_gc();
     finalizer_allocation_runs_no_gc();
     finalization_registry_job_oom();
+    module_value_outlives_context();
+    module_pending_await();
     parser_scope_out_of_memory();
     parser_label_out_of_memory();
     await_using_outside_async();
