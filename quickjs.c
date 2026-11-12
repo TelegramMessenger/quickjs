@@ -3800,7 +3800,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
     }
 
     if (str) {
-        if (str->atom_type == 0) {
+        if (str->atom_type == 0 && str->kind == JS_STRING_KIND_NORMAL) {
             p = str;
             p->atom_type = atom_type;
         } else {
@@ -3816,8 +3816,9 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
             list_add_tail(&p->link, &rt->string_list);
 #endif
-            memcpy(str8(p), str8(str), (str->len << str->is_wide_char) +
-                   1 - str->is_wide_char);
+            memcpy(str8(p), str8(str), str->len << str->is_wide_char);
+            if (!str->is_wide_char)
+                str8(p)[str->len] = '\0';
             js_free_string(rt, str);
         }
     } else {

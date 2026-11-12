@@ -2772,6 +2772,28 @@ static long compile_with_alloc_failure(const char *src, int eval_type,
     return requests;
 }
 
+static void slice_atom_releases_parent(void)
+{
+    static const char code[] =
+        "for (var i = 0; i < 100; i++) {\n"
+        "    var p = String(i).padStart(7, '0') + 'x'.repeat(1000000);\n"
+        "    var s = p.substring(0, 500000);\n"
+        "    var o = {};\n"
+        "    o[s] = 1;\n"
+        "    Symbol(p.substring(1, 500000));\n"
+        "}\n";
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue ret;
+
+    JS_SetMemoryLimit(rt, 16 << 20);
+    ret = eval(ctx, code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void parser_allocation_failure(void)
 {
     static const char script[] =
@@ -3150,6 +3172,7 @@ int main(void)
     add_intrinsic_bigint();
     new_typed_array();
     std_eval_interrupt_handler();
+    slice_atom_releases_parent();
     uncatchable_interrupt_sites();
     uncatchable_interrupt_at_memory_limit();
     uncatchable_out_of_memory();
