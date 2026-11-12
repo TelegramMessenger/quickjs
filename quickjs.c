@@ -22487,6 +22487,7 @@ typedef enum JSAsyncGeneratorStateEnum {
     JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD,
     JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR,
     JS_ASYNC_GENERATOR_STATE_EXECUTING,
+    JS_ASYNC_GENERATOR_STATE_AWAITING, /* suspended in an await whose reactions are registered */
     JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN,
     JS_ASYNC_GENERATOR_STATE_COMPLETED,
 } JSAsyncGeneratorStateEnum;
@@ -22728,6 +22729,7 @@ static int js_async_generator_resume_next(JSContext *ctx,
         case JS_ASYNC_GENERATOR_STATE_EXECUTING:
             /* only happens when restarting execution after await() */
             goto resume_exec;
+        case JS_ASYNC_GENERATOR_STATE_AWAITING:
         case JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN:
             goto done;
         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_START:
@@ -22803,6 +22805,7 @@ static int js_async_generator_resume_next(JSContext *ctx,
                         s->func_state.throw_flag = true;
                         goto resume_exec;
                     }
+                    s->state = JS_ASYNC_GENERATOR_STATE_AWAITING;
                     goto done;
                 default:
                     abort();
@@ -22848,8 +22851,9 @@ static JSValue js_async_generator_resolve_function(JSContext *ctx,
         }
         if (js_uncatchable_pending(ctx))
             return JS_EXCEPTION;
-    } else if (s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING) {
+    } else if (s->state == JS_ASYNC_GENERATOR_STATE_AWAITING) {
         /* restart function execution after await() */
+        s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
         s->func_state.throw_flag = is_reject;
         if (is_reject) {
             JS_Throw(ctx, js_dup(arg));
