@@ -3061,6 +3061,22 @@ static void own_property_value_allocation_failure(void)
         "function check() { return D !== null && typeof D.value == 'unknown'; }\n");
 }
 
+static void function_name_allocation_failure(void)
+{
+    stored_exception_value(
+        "var F = null;\n"
+        "function go() { F = null; F = { 12: function () {} }[12]; }\n"
+        "function check() { return F !== null && typeof F.name == 'unknown'; }\n");
+    stored_exception_value(
+        "var F = null;\n"
+        "function go() { F = null; F = { 14: class {} }[14]; }\n"
+        "function check() { return F !== null && typeof F.name == 'unknown'; }\n");
+    stored_exception_value(
+        "var F = null;\n"
+        "function go() { F = null; F = { 16() {} }[16]; }\n"
+        "function check() { return F !== null && typeof F.name == 'unknown'; }\n");
+}
+
 int main(void)
 {
     cfunctions();
@@ -3114,6 +3130,7 @@ int main(void)
     normalize_out_of_memory();
     exception_without_value();
     own_property_value_allocation_failure();
+    function_name_allocation_failure();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();

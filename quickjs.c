@@ -6754,11 +6754,16 @@ JSValue JS_NewObject(JSContext *ctx)
 static void js_function_set_properties(JSContext *ctx, JSValue func_obj,
                                        JSAtom name, int len)
 {
+    JSValue name_str;
+
     /* ES6 feature non compatible with ES5.1: length is configurable */
     JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_length, js_int32(len),
                            JS_PROP_CONFIGURABLE);
-    JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_name,
-                           JS_AtomToString(ctx, name), JS_PROP_CONFIGURABLE);
+    name_str = JS_AtomToString(ctx, name);
+    if (JS_IsException(name_str))
+        return;
+    JS_DefinePropertyValue(ctx, func_obj, JS_ATOM_name, name_str,
+                           JS_PROP_CONFIGURABLE);
 }
 
 static bool js_class_has_bytecode(JSClassID class_id)
@@ -12122,11 +12127,16 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
 static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
                                JSAtom name, int flags)
 {
+    JSValue name_str;
+
     if (name != JS_ATOM_NULL
     &&  JS_IsObject(obj)
-    &&  !js_object_has_name(ctx, obj)
-    &&  JS_DefinePropertyValue(ctx, obj, JS_ATOM_name, JS_AtomToString(ctx, name), flags) < 0) {
-        return -1;
+    &&  !js_object_has_name(ctx, obj)) {
+        name_str = JS_AtomToString(ctx, name);
+        if (JS_IsException(name_str))
+            return -1;
+        if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_name, name_str, flags) < 0)
+            return -1;
     }
     return 0;
 }
