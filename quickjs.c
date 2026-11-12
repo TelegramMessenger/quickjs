@@ -10247,6 +10247,8 @@ retry:
                         desc->getter = JS_UNDEFINED;
                         desc->setter = JS_UNDEFINED;
                         desc->value = JS_GetPropertyUint32(ctx, JS_MKPTR(JS_TAG_OBJECT, p), idx);
+                        if (unlikely(JS_IsException(desc->value)))
+                            return -1;
                     } else if (flags_only) {
                         *pflags = JS_PROP_WRITABLE | JS_PROP_ENUMERABLE |
                             JS_PROP_CONFIGURABLE;
@@ -47884,6 +47886,8 @@ static int js_string_get_own_property(JSContext *ctx,
                     ch = string_get(p1, idx);
                     desc->flags = JS_PROP_ENUMERABLE;
                     desc->value = js_new_string_char(ctx, ch);
+                    if (unlikely(JS_IsException(desc->value)))
+                        return -1;
                     desc->getter = JS_UNDEFINED;
                     desc->setter = JS_UNDEFINED;
                 }

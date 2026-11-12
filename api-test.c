@@ -3003,6 +3003,64 @@ static void exception_without_value(void)
     JS_FreeRuntime(rt);
 }
 
+/* calls go() with each growing allocation failing in turn, then asks check() whether script sees the exception marker as a value */
+static void stored_exception_value(const char *setup)
+{
+    static const JSMallocFunctions mf = {
+        alloc_failure_calloc,
+        alloc_failure_malloc,
+        alloc_failure_free,
+        alloc_failure_realloc,
+        alloc_failure_usable_size,
+    };
+    JSRuntime *rt = JS_NewRuntime2(&mf, NULL);
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue global, go, check, ret;
+    long n, requests;
+
+    alloc_failure.armed = false;
+    ret = JS_Eval(ctx, setup, strlen(setup), "<setup>", JS_EVAL_TYPE_GLOBAL);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    global = JS_GetGlobalObject(ctx);
+    go = JS_GetPropertyStr(ctx, global, "go");
+    check = JS_GetPropertyStr(ctx, global, "check");
+    assert(JS_IsFunction(ctx, go) && JS_IsFunction(ctx, check));
+    requests = 1;
+    for (n = 0; n <= requests; n++) {
+        alloc_failure.requests = 0;
+        alloc_failure.fail_at = n;
+        alloc_failure.armed = true;
+        ret = JS_Call(ctx, go, JS_UNDEFINED, 0, NULL);
+        alloc_failure.armed = false;
+        if (n == 0) {
+            assert(!JS_IsException(ret));
+            requests = alloc_failure.requests;
+        }
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        ret = JS_Call(ctx, check, JS_UNDEFINED, 0, NULL);
+        assert(JS_IsBool(ret) && !JS_VALUE_GET_BOOL(ret));
+    }
+    JS_FreeValue(ctx, check);
+    JS_FreeValue(ctx, go);
+    JS_FreeValue(ctx, global);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static void own_property_value_allocation_failure(void)
+{
+    stored_exception_value(
+        "var S = new String('abc'), D = null;\n"
+        "function go() { D = null; D = Object.getOwnPropertyDescriptor(S, 1); }\n"
+        "function check() { return D !== null && typeof D.value == 'unknown'; }\n");
+    stored_exception_value(
+        "var B = new BigUint64Array([2n ** 63n]), D = null;\n"
+        "function go() { D = null; D = Reflect.getOwnPropertyDescriptor(B, 0); }\n"
+        "function check() { return D !== null && typeof D.value == 'unknown'; }\n");
+}
+
 int main(void)
 {
     cfunctions();
@@ -3055,6 +3113,7 @@ int main(void)
     with_branch_polls_interrupts();
     normalize_out_of_memory();
     exception_without_value();
+    own_property_value_allocation_failure();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();
