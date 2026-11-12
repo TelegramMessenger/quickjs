@@ -25145,7 +25145,8 @@ static int push_scope(JSParseState *s) {
     if (s->cur_func) {
         JSFunctionDef *fd = s->cur_func;
         int scope = fd->scope_count;
-        /* XXX: should check for scope overflow */
+        if (scope > 0xffff)
+            return js_parse_error(s, "too many scopes in function (only %d allowed)", 0x10000);
         if ((fd->scope_count + 1) > fd->scope_size) {
             int new_size;
             JSVarScope *new_buf;
