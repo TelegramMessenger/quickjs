@@ -3428,6 +3428,25 @@ static void promise_combinator_out_of_memory(void)
     }
 }
 
+static void set_property_lazy_prototype_out_of_memory(void)
+{
+    static const char setup[] =
+        "function X() {}\n"
+        "X.prototype;\n"
+        "function f() { X.prototype.toString = function () {}; }\n";
+    size_t headroom;
+    bool done = false, failed = false;
+
+    /* Object.prototype.toString is created on first use, here by the lookup of the assignment */
+    for (headroom = 0; headroom < 2048; headroom += 16) {
+        if (call_at_memory_limit(setup, "", headroom))
+            failed = true;
+        else
+            done = true;
+    }
+    assert(failed && done);
+}
+
 static void resolver_allocation_failure(void)
 {
     static const char *const uses[] = {
@@ -3768,6 +3787,7 @@ int main(void)
     lazy_builtin_out_of_memory();
     set_prototype_out_of_memory();
     promise_combinator_out_of_memory();
+    set_property_lazy_prototype_out_of_memory();
     parser_scope_out_of_memory();
     parser_label_out_of_memory();
     await_using_outside_async();
