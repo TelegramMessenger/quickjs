@@ -2908,6 +2908,47 @@ static void with_branch_polls_interrupts(void)
     JS_FreeRuntime(rt);
 }
 
+static void normalize_out_of_memory(void)
+{
+    static const char code[] =
+        "var s = 'e'.repeat(200000), caught = 'none';"
+        " try { s.normalize('NFD'); } catch (e) { caught = typeof e; }"
+        " caught";
+    bool oom_seen = false, done_seen = false;
+    size_t limit;
+
+    /* somewhere in this range the UTF-32 copy of the string fits and the work buffer does not */
+    for (limit = 1200000; limit < 4800000; limit += 40000) {
+        JSRuntime *rt = new_runtime();
+        JSContext *ctx;
+        JSValue ret;
+
+        JS_SetMemoryLimit(rt, limit);
+        ctx = JS_NewContext(rt);
+        ret = eval(ctx, code);
+        JS_SetMemoryLimit(rt, 0);
+        if (JS_IsException(ret)) {
+            JSValue e = JS_GetException(ctx);
+
+            assert(JS_IsError(e));
+            assert(JS_IsUncatchableError(e));
+            JS_FreeValue(ctx, e);
+            oom_seen = true;
+        } else {
+            const char *str = JS_ToCString(ctx, ret);
+
+            assert(str != NULL);
+            assert(!strcmp(str, "none"));
+            JS_FreeCString(ctx, str);
+            done_seen = true;
+        }
+        JS_FreeValue(ctx, ret);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+    }
+    assert(oom_seen && done_seen);
+}
+
 int main(void)
 {
     cfunctions();
@@ -2958,6 +2999,7 @@ int main(void)
     resolver_allocation_failure();
     regexp_allocation_failure();
     with_branch_polls_interrupts();
+    normalize_out_of_memory();
     private_symbols();
     new_context_low_memory();
     json_stringify_oom();

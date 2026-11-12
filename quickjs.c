@@ -49421,7 +49421,7 @@ static JSValue js_string_normalize(JSContext *ctx, JSValueConst this_val,
                                 ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
     js_free(ctx, buf);
     if (out_len < 0)
-        return JS_EXCEPTION;
+        return JS_ThrowOutOfMemory(ctx);
     val = JS_NewUTF32String(ctx, out_buf, out_len);
     js_free(ctx, out_buf);
     return val;
