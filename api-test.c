@@ -3104,6 +3104,61 @@ static void out_of_memory_exception_runs_no_gc(void)
     JS_FreeRuntime(rt);
 }
 
+static struct {
+    JSContext *ctx;
+    int depth;
+    int calls;
+    bool nested;
+} finalizer_alloc;
+
+static void finalizer_alloc_finalizer(JSRuntime *rt, JSValueConst val)
+{
+    finalizer_alloc.calls++;
+    if (finalizer_alloc.depth++)
+        finalizer_alloc.nested = true;
+    else if (finalizer_alloc.ctx)
+        JS_FreeValue(finalizer_alloc.ctx, JS_NewObject(finalizer_alloc.ctx));
+    finalizer_alloc.depth--;
+}
+
+static void finalizer_allocation_runs_no_gc(void)
+{
+    JSClassDef def = (JSClassDef){
+        .class_name = "FinalizerAlloc",
+        .finalizer = finalizer_alloc_finalizer,
+    };
+    JSClassID class_id = 0;
+    JSValue obj[3];
+    JSRuntime *rt;
+    JSContext *ctx;
+    int i;
+
+    rt = new_runtime();
+    ctx = JS_NewContext(rt);
+    JS_NewClassID(rt, &class_id);
+    assert(0 == JS_NewClass(rt, class_id, &def));
+    JS_SetGCThreshold(rt, (size_t)-1);
+    for (i = 0; i < 3; i++) {
+        obj[i] = JS_NewObjectClass(ctx, class_id);
+        assert(JS_IsObject(obj[i]));
+    }
+    for (i = 1; i < 3; i++) {
+        JS_SetPropertyStr(ctx, obj[i], "self", JS_DupValue(ctx, obj[i]));
+        JS_FreeValue(ctx, obj[i]);
+    }
+    memset(&finalizer_alloc, 0, sizeof(finalizer_alloc));
+    finalizer_alloc.ctx = ctx;
+    JS_SetGCThreshold(rt, 0);
+    /* the object its finalizer allocates must not collect the two cycles from inside the free */
+    JS_FreeValue(ctx, obj[0]);
+    assert(finalizer_alloc.calls == 1 && !finalizer_alloc.nested);
+    JS_RunGC(rt);
+    assert(finalizer_alloc.calls == 3 && !finalizer_alloc.nested);
+    finalizer_alloc.ctx = NULL;
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void resolver_allocation_failure(void)
 {
     static const char *const uses[] = {
@@ -3436,6 +3491,7 @@ int main(void)
     uncatchable_out_of_memory();
     shape_resize_allocation_failure();
     out_of_memory_exception_runs_no_gc();
+    finalizer_allocation_runs_no_gc();
     parser_scope_out_of_memory();
     parser_label_out_of_memory();
     await_using_outside_async();
