@@ -2418,6 +2418,118 @@ static void uncatchable_interrupt_at_memory_limit(void)
     }
 }
 
+static int nth_call_interrupt_handler(JSContext *ctx, void *opaque)
+{
+    int *calls_left = (int *)opaque;
+    return --*calls_left <= 0;
+}
+
+typedef struct NativeLoop {
+    const char *setup;
+    const char *code;
+    bool completes;
+} NativeLoop;
+
+static void interrupt_native_loops(const NativeLoop *loops, size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        bool done = false;
+        int nth;
+
+        for (nth = 1; !done; nth++) {
+            JSRuntime *rt = new_runtime();
+            JSContext *ctx = JS_NewContext(rt);
+            JSValue ret, e;
+            const char *str;
+            uint64_t start, elapsed;
+            int calls_left = nth;
+
+            ret = eval(ctx, loops[i].setup);
+            assert(!JS_IsException(ret));
+            JS_FreeValue(ctx, ret);
+            JS_SetInterruptHandler(rt, nth_call_interrupt_handler, &calls_left);
+            start = js__hrtime_ns();
+            ret = eval(ctx, loops[i].code);
+            elapsed = js__hrtime_ns() - start;
+            JS_SetInterruptHandler(rt, NULL, NULL);
+            if (JS_IsException(ret)) {
+                assert(calls_left <= 0);
+                assert(elapsed < 1000000000);
+                e = JS_GetException(ctx);
+                assert(JS_IsUncatchableError(e));
+                str = JS_ToCString(ctx, e);
+                assert(str != NULL);
+                assert(strstr(str, "InternalError: interrupted"));
+                JS_FreeCString(ctx, str);
+                JS_FreeValue(ctx, e);
+                done = !loops[i].completes && nth == 3;
+            } else {
+                assert(loops[i].completes);
+                assert(nth > 3);
+                done = true;
+            }
+            JS_FreeValue(ctx, ret);
+            ret = eval(ctx, "1 + 1");
+            assert(JS_VALUE_GET_TAG(ret) == JS_TAG_INT);
+            assert(JS_VALUE_GET_INT(ret) == 2);
+            JS_FreeValue(ctx, ret);
+            JS_FreeContext(ctx);
+            JS_FreeRuntime(rt);
+        }
+    }
+}
+
+static void array_loops_poll_interrupts(void)
+{
+    static const char holes[] = "var a = []; a.length = 0xfffffffe;";
+    static const char long_strings[] =
+        "var s = 'a'.repeat(1 << 24), x = s + 'x', y = s + 'y';"
+        " var a = new Array(100000).fill(x);";
+    static const char long_bigints[] =
+        "var x = (1n << 1000000n) + 1n, y = x + 1n;"
+        " var a = new Array(100000).fill(x);";
+    static const NativeLoop loops[] = {
+        { holes, "a.join('')", false },
+        { holes, "a.toString()", false },
+        { holes, "a.reverse()", false },
+        { holes, "a.slice(0)", false },
+        { holes, "a.splice(0, 1)", false },
+        { holes, "a.shift()", false },
+        { holes, "a.unshift(1)", false },
+        { holes, "a.copyWithin(1, 0)", false },
+        { holes, "[].concat(a)", false },
+        { holes, "a.flat()", false },
+        { holes, "a.sort()", false },
+        { holes, "a.fill(0)", false },
+        { "", "Array.from({ length: 0xfffffffe })", false },
+        { long_strings, "a.includes(y)", false },
+        { long_strings, "a.indexOf(y)", false },
+        { long_strings, "a.lastIndexOf(y)", false },
+        { long_bigints, "a.indexOf(y)", false },
+        { "var s = 'a'.repeat(1 << 24); var a = new Array(3000).fill(s);",
+          "a.sort()", false },
+        { "", "Array.prototype.with.call({ length: 100000 }, 50000, 1)", true },
+        { "", "Array.prototype.toReversed.call({ length: 100000 })", true },
+        { "", "Array.prototype.toSpliced.call({ length: 100000 }, 50000, 1)",
+          true },
+        { "", "Array.prototype.toSorted.call({ length: 100000 })", true },
+        { "var a = []; a.length = 100000; a[99999] = 1;",
+          "a.splice(0, 50000)", true },
+        { "var a = []; a.length = 60000; a[0] = 1; a[100] = 2; a[59999] = 3;",
+          "a.reverse()", true },
+        { "var a = []; a.length = 50000; a[49999] = [];"
+          " a[49999].length = 50000; a[49999][49999] = 1;",
+          "a.flat()", true },
+        { "var a = [];"
+          " for (var i = 0; i < 3000; i++) a[i * 30] = 'k' + i * 7919 % 3000;",
+          "a.sort()", true },
+    };
+
+    interrupt_native_loops(loops, sizeof(loops) / sizeof(loops[0]));
+}
+
 /* Running out of memory is uncatchable too: no catch block runs, and the
    embedder gets an InternalError object even when the error object itself
    was the allocation that failed. The limits sweep the point at which the
@@ -3964,6 +4076,7 @@ int main(void)
     atom_allocation_failure();
     uncatchable_interrupt_sites();
     uncatchable_interrupt_at_memory_limit();
+    array_loops_poll_interrupts();
     uncatchable_out_of_memory();
     shape_resize_allocation_failure();
     out_of_memory_exception_runs_no_gc();
