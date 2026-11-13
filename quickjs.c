@@ -9170,11 +9170,11 @@ static inline __exception int js_poll_interrupts(JSContext *ctx)
 }
 
 /* one poll after a native step that did the work of 'n' ordinary ones */
-static inline __exception int js_poll_interrupts_n(JSContext *ctx, int n)
+static inline __exception int js_poll_interrupts_n(JSContext *ctx, int64_t n)
 {
-    ctx->interrupt_counter -= n;
-    if (unlikely(ctx->interrupt_counter <= 0))
+    if (unlikely(n >= ctx->interrupt_counter))
         return __js_poll_interrupts(ctx);
+    ctx->interrupt_counter -= n < 1 ? 1 : (int)n;
     return 0;
 }
 
@@ -11050,6 +11050,8 @@ static JSValue js_allocate_fast_array(JSContext *ctx, int64_t len)
 
     if (len > INT32_MAX)
         return JS_ThrowRangeError(ctx, "invalid array length");
+    if (js_poll_interrupts_n(ctx, len >> 4))
+        return JS_EXCEPTION;
     arr = JS_NewArray(ctx);
     if (JS_IsException(arr))
         return arr;
@@ -18005,6 +18007,8 @@ static __exception int js_append_enumerate(JSContext *ctx, JSValue *sp)
            the prototypes and might have side effects */
         if (len != count32)
             goto general_case;
+        if (js_poll_interrupts_n(ctx, count32 >> 2))
+            goto exception;
         /* Handle fast arrays explicitly */
         for (i = 0; i < count32; i++) {
             if (JS_DefinePropertyValueUint32(ctx, sp[-3], pos++,
@@ -43674,6 +43678,8 @@ static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
                            JS_MAX_LOCAL_VARS);
         return NULL;
     }
+    if (js_poll_interrupts_n(ctx, len >> 2))
+        return NULL;
     /* avoid allocating 0 bytes */
     tab = js_mallocz(ctx, sizeof(tab[0]) * max_uint32(1, len));
     if (!tab)
@@ -45047,6 +45053,8 @@ static JSValue js_array_includes(JSContext *ctx, JSValueConst this_val,
         }
         cost = js_strict_eq_cost(argv[0]);
         if (js_get_fast_array(ctx, obj, &arrp, &count)) {
+            if (js_poll_interrupts_n(ctx, count >> 4))
+                goto exception;
             for (; n < count; n++) {
                 if (js_strict_eq2(ctx, argv[0], arrp[n],
                                   JS_EQ_SAME_VALUE_ZERO)) {
@@ -45100,6 +45108,8 @@ static JSValue js_array_indexOf(JSContext *ctx, JSValueConst this_val,
         }
         cost = js_strict_eq_cost(argv[0]);
         if (js_get_fast_array(ctx, obj, &arrp, &count)) {
+            if (js_poll_interrupts_n(ctx, count >> 4))
+                goto exception;
             for (; n < count; n++) {
                 if (js_strict_eq2(ctx, argv[0], arrp[n], JS_EQ_STRICT)) {
                     goto done;
@@ -45154,6 +45164,8 @@ static JSValue js_array_lastIndexOf(JSContext *ctx, JSValueConst this_val,
         }
         cost = js_strict_eq_cost(argv[0]);
         if (js_get_fast_array(ctx, obj, &arrp, &count) && count == len) {
+            if (js_poll_interrupts_n(ctx, count >> 4))
+                goto exception;
             for (; n >= 0; n--) {
                 if (js_strict_eq2(ctx, argv[0], arrp[n],
                                   JS_EQ_STRICT)) {
@@ -45369,6 +45381,8 @@ static JSValue js_array_pop(JSContext *ctx, JSValueConst this_val,
         if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
             JSObject *p = JS_VALUE_GET_OBJ(obj);
             if (shift) {
+                if (js_poll_interrupts_n(ctx, count32 >> 6))
+                    goto exception;
                 res = arrp[0];
                 memmove(arrp, arrp + 1, (count32 - 1) * sizeof(*arrp));
                 p->u.array.count--;
@@ -45488,6 +45502,8 @@ static JSValue js_array_reverse(JSContext *ctx, JSValueConst this_val,
     if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
         uint32_t ll, hh;
 
+        if (js_poll_interrupts_n(ctx, count32 >> 4))
+            goto exception;
         if (count32 > 1) {
             for (ll = 0, hh = count32 - 1; ll < hh; ll++, hh--) {
                 lval = arrp[ll];
@@ -45649,6 +45665,8 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
     /* Special case fast arrays */
     if (js_get_fast_array(ctx, obj, &arrp, &count32) &&
         js_is_fast_array(ctx, arr)) {
+        if (js_poll_interrupts_n(ctx, (min_int64(final, count32) - k) >> 2))
+            goto exception;
         /* XXX: should share code with fast array constructor */
         for (; k < final && k < count32; k++, n++) {
             if (JS_CreateDataPropertyUint32Const(ctx, arr, n, arrp[k], JS_PROP_THROW) < 0)
@@ -61562,6 +61580,8 @@ static JSValue js_typed_array_set_internal(JSContext *ctx,
 
         /* copying between typed objects */
         if (src_p->class_id == p->class_id) {
+            if (js_poll_interrupts_n(ctx, (src_len << shift) >> 10))
+                goto fail;
             /* same type, use memmove */
             memmove(dest_abuf->data + dest_ta->offset + (offset << shift),
                     src_abuf->data + src_ta->offset, src_len << shift);
@@ -61584,6 +61604,8 @@ static JSValue js_typed_array_set_internal(JSContext *ctx,
         }
     }
     for(i = 0; i < src_len; i++) {
+        if (js_poll_interrupts(ctx))
+            goto fail;
         val = JS_GetPropertyUint32(ctx, src_obj, i);
         if (JS_IsException(val))
             goto fail;
@@ -61699,6 +61721,10 @@ static JSValue js_typed_array_with(JSContext *ctx, JSValueConst this_val,
 
     copy_len = min_uint32(len, newlen);
     size_log2 = typed_array_size_log2(p->class_id);
+    if (js_poll_interrupts_n(ctx, ((int64_t)len << size_log2) >> 10)) {
+        JS_FreeValue(ctx, val);
+        return JS_EXCEPTION;
+    }
 
     /* create new typed array with original length (zero-initialized) */
     arr = js_create_from_ctor(ctx, JS_UNDEFINED, p->class_id);
@@ -61896,6 +61922,8 @@ static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val,
     if (JS_IsException(r))
         goto exception;
     for(k = 0; k < len; k++) {
+        if (js_poll_interrupts(ctx))
+            goto exception;
         v = JS_GetPropertyInt64(ctx, arr, k);
         if (JS_IsException(v))
             goto exception;
@@ -61982,6 +62010,8 @@ static JSValue js_typed_array_copyWithin(JSContext *ctx, JSValueConst this_val,
     count = min_int(count, space);
     if (count > 0) {
         shift = typed_array_size_log2(p->class_id);
+        if (js_poll_interrupts_n(ctx, ((int64_t)count << shift) >> 10))
+            return JS_EXCEPTION;
         memmove(p->u.array.u.uint8_ptr + (to << shift),
                 p->u.array.u.uint8_ptr + (from << shift),
                 count << shift);
@@ -62057,6 +62087,8 @@ static JSValue js_typed_array_fill(JSContext *ctx, JSValueConst this_val,
     // RAB may have been resized by evil .valueOf method
     final = min_int(final, p->u.array.count);
     shift = typed_array_size_log2(p->class_id);
+    if (js_poll_interrupts_n(ctx, ((int64_t)max_int(final - k, 0) << shift) >> 10))
+        return JS_EXCEPTION;
     switch(shift) {
     case 0:
         if (k < final) {
@@ -62224,6 +62256,8 @@ static JSValue js_typed_array_indexOf(JSContext *ctx, JSValueConst this_val,
     else
         k = min_int(k, len);
     stop = min_int(stop, len);
+    if (js_poll_interrupts_n(ctx, len >> 4))
+        goto exception;
 
     is_bigint = 0;
     is_int = 0; /* avoid warning */
@@ -62488,6 +62522,8 @@ static JSValue js_typed_array_join(JSContext *ctx, JSValueConst this_val,
 
     /* XXX: optimize with direct access */
     for(i = 0; i < len; i++) {
+        if (js_poll_interrupts(ctx))
+            goto fail;
         if (i > 0) {
             if (c >= 0) {
                 if (string_buffer_putc8(b, c))
@@ -62544,6 +62580,8 @@ static JSValue js_typed_array_reverse(JSContext *ctx, JSValueConst this_val,
     p = JS_VALUE_GET_OBJ(this_val);
     if (typed_array_is_immutable(p))
         return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
+    if (js_poll_interrupts_n(ctx, len >> 4))
+        return JS_EXCEPTION;
     if (len > 0) {
         switch (typed_array_size_log2(p->class_id)) {
         case 0:
@@ -62664,6 +62702,8 @@ static JSValue js_typed_array_slice(JSContext *ctx, JSValueConst this_val,
             src = p->u.array.u.uint8_ptr + (start << shift);
             dst = p1->u.array.u.uint8_ptr;
             nbytes = count << shift;
+            if (js_poll_interrupts_n(ctx, nbytes >> 10))
+                goto exception;
             if (dst > src && dst < src + nbytes) {
                 /* per spec (step 14.g) the copy is performed byte by byte
                    in increasing order, observable when the species
@@ -62679,6 +62719,8 @@ static JSValue js_typed_array_slice(JSContext *ctx, JSValueConst this_val,
             space = max_int(0, p->u.array.count - start);
             count = min_int(count, space);
             for (n = 0; n < count; n++) {
+                if (js_poll_interrupts(ctx))
+                    goto exception;
                 val = JS_GetPropertyValue(ctx, this_val, js_int32(start + n));
                 if (JS_IsException(val))
                     goto exception;
@@ -63055,6 +63097,8 @@ static JSValue js_typed_array_sort(JSContext *ctx, JSValueConst this_val,
         done:
             js_free(ctx, array_idx);
         } else {
+            if (js_poll_interrupts_n(ctx, len))
+                return JS_EXCEPTION;
             rqsort(p->u.array.u.ptr, len, elt_size, cmpfun, &tsc);
             if (tsc.exception)
                 return JS_EXCEPTION;
@@ -63251,6 +63295,8 @@ static JSValue js_typed_array_constructor_obj(JSContext *ctx,
         goto fail;
 
     for(i = 0; i < len; i++) {
+        if (js_poll_interrupts(ctx))
+            goto fail;
         val = JS_GetPropertyUint32(ctx, arr, i);
         if (JS_IsException(val))
             goto fail;
@@ -63315,12 +63361,16 @@ static JSValue js_typed_array_constructor_ta(JSContext *ctx,
     abuf = JS_GetOpaque(buffer, JS_CLASS_ARRAY_BUFFER);
     if (typed_array_init(ctx, obj, buffer, 0, len, /*track_rab*/false))
         goto fail;
+    if (js_poll_interrupts_n(ctx, abuf->byte_length >> 10))
+        goto fail;
     if (p->class_id == classid) {
         /* same type: copy the content */
         memcpy(abuf->data, src_abuf->data + ta->offset, abuf->byte_length);
     } else {
         for(i = 0; i < len; i++) {
             JSValue val;
+            if (js_poll_interrupts(ctx))
+                goto fail;
             val = JS_GetPropertyUint32(ctx, src_obj, i);
             if (JS_IsException(val))
                 goto fail;

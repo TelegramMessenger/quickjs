@@ -2555,6 +2555,61 @@ static void string_search_polls_interrupts(void)
     interrupt_native_loops(loops, sizeof(loops) / sizeof(loops[0]));
 }
 
+static void typed_array_loops_poll_interrupts(void)
+{
+    static const char bytes[] = "var t = new Uint8Array(1 << 21);";
+    static const NativeLoop loops[] = {
+        { bytes, "t.join('')", false },
+        { bytes, "t.set({ length: 1 << 21 })", false },
+        { bytes, "t.set(new Uint16Array(1 << 21))", false },
+        { bytes, "new Uint16Array(t)", false },
+        { "", "new Uint8Array({ length: 1 << 21 })", false },
+        { "", "Uint8Array.from({ length: 1 << 21 })", false },
+        { "class A extends Uint8Array {"
+          " static get [Symbol.species]() { return Uint16Array; } }"
+          " var t = new A(1 << 21);", "t.slice()", false },
+        { bytes, "for (;;) t.sort()", false },
+        { bytes, "for (;;) t.toSorted()", false },
+        { bytes, "for (;;) t.reverse()", false },
+        { bytes, "for (;;) t.toReversed()", false },
+        { bytes, "for (;;) t.indexOf(1)", false },
+        { bytes, "for (;;) t.lastIndexOf(1)", false },
+        { bytes, "for (;;) t.includes(1)", false },
+        { bytes, "for (;;) t.fill(1)", false },
+        { bytes, "for (;;) t.copyWithin(1, 0)", false },
+        { bytes, "for (;;) t.set(t)", false },
+        { bytes, "for (;;) t.slice()", false },
+        { bytes, "for (;;) t.with(0, 1)", false },
+        { bytes, "for (;;) new Uint8Array(t)", false },
+    };
+
+    interrupt_native_loops(loops, sizeof(loops) / sizeof(loops[0]));
+}
+
+static void fast_array_passes_poll_interrupts(void)
+{
+    static const char values[] = "var a = new Array(1 << 17).fill(0);";
+    static const char args[] =
+        "var a = new Array(65000).fill(0); function f() {}";
+    static const NativeLoop loops[] = {
+        { values, "for (;;) a.indexOf(1)", false },
+        { values, "for (;;) a.lastIndexOf(1)", false },
+        { values, "for (;;) a.includes(1)", false },
+        { values, "for (;;) a.reverse()", false },
+        { values, "for (;;) a.push(a.shift())", false },
+        { values, "for (;;) a.slice()", false },
+        { values, "for (;;) a.with(0, 1)", false },
+        { values, "for (;;) a.toReversed()", false },
+        { values, "for (;;) a.toSpliced(0, 1)", false },
+        { values, "for (;;) [...a]", false },
+        { args, "for (;;) f.apply(null, a)", false },
+        { args, "for (;;) f(...a)", false },
+        { args, "for (;;) Reflect.apply(f, null, { length: 65000 })", false },
+    };
+
+    interrupt_native_loops(loops, sizeof(loops) / sizeof(loops[0]));
+}
+
 /* Running out of memory is uncatchable too: no catch block runs, and the
    embedder gets an InternalError object even when the error object itself
    was the allocation that failed. The limits sweep the point at which the
@@ -4103,6 +4158,8 @@ int main(void)
     uncatchable_interrupt_at_memory_limit();
     array_loops_poll_interrupts();
     string_search_polls_interrupts();
+    typed_array_loops_poll_interrupts();
+    fast_array_passes_poll_interrupts();
     uncatchable_out_of_memory();
     shape_resize_allocation_failure();
     out_of_memory_exception_runs_no_gc();
