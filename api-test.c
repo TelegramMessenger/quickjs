@@ -2530,6 +2530,31 @@ static void array_loops_poll_interrupts(void)
     interrupt_native_loops(loops, sizeof(loops) / sizeof(loops[0]));
 }
 
+static void string_search_polls_interrupts(void)
+{
+    static const char narrow[] =
+        "var s = 'a'.repeat(1 << 22), t = 'a'.repeat(1 << 21) + 'b';";
+    static const char wide[] =
+        "var s = 'a'.repeat(1 << 22) + '\\u1234', t = 'a'.repeat(1 << 21) + 'b';";
+    static const char pairs[] = "var s = 'ab'.repeat(30000);";
+    static const NativeLoop loops[] = {
+        { narrow, "s.indexOf(t)", false },
+        { narrow, "s.lastIndexOf(t)", false },
+        { narrow, "s.includes(t)", false },
+        { narrow, "s.split(t)", false },
+        { narrow, "s.replace(t, '')", false },
+        { narrow, "s.replaceAll(t, '')", false },
+        { wide, "s.indexOf(t)", false },
+        { wide, "s.lastIndexOf(t)", false },
+        { pairs, "s.split('b')", true },
+        { pairs, "s.split('')", true },
+        { pairs, "s.replaceAll('b', 'cc')", true },
+        { pairs, "s.replaceAll('', '-')", true },
+    };
+
+    interrupt_native_loops(loops, sizeof(loops) / sizeof(loops[0]));
+}
+
 /* Running out of memory is uncatchable too: no catch block runs, and the
    embedder gets an InternalError object even when the error object itself
    was the allocation that failed. The limits sweep the point at which the
@@ -4077,6 +4102,7 @@ int main(void)
     uncatchable_interrupt_sites();
     uncatchable_interrupt_at_memory_limit();
     array_loops_poll_interrupts();
+    string_search_polls_interrupts();
     uncatchable_out_of_memory();
     shape_resize_allocation_failure();
     out_of_memory_exception_runs_no_gc();

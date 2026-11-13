@@ -48552,20 +48552,49 @@ static int string_indexof_char(JSString *p, int c, int from)
     return -1;
 }
 
-static int string_indexof(JSString *p1, JSString *p2, int from)
+/* string_cmp() for a search loop: 1 if different, -1 if interrupted */
+static int string_cmp_poll(JSContext *ctx, JSString *p1, JSString *p2,
+                           int x1, int x2, int len)
+{
+    int n;
+
+    do {
+        n = min_int(len, 1024);
+        if (js_poll_interrupts_n(ctx, 1 + (n >> 8)))
+            return -1;
+        if (string_cmp(p1, p2, x1, x2, n))
+            return 1;
+        x1 += n;
+        x2 += n;
+        len -= n;
+    } while (len > 0);
+    return 0;
+}
+
+static __exception int string_indexof(JSContext *ctx, int *pres,
+                                      JSString *p1, JSString *p2, int from)
 {
     /* assuming 0 <= from <= p1->len */
-    int c, i, j, len1 = p1->len, len2 = p2->len;
-    if (len2 == 0)
-        return from;
+    int c, i, j, ret, len1 = p1->len, len2 = p2->len;
+
+    *pres = -1;
+    if (len2 == 0) {
+        *pres = from;
+        return 0;
+    }
     for (i = from, c = string_get(p2, 0); i + len2 <= len1; i = j + 1) {
         j = string_indexof_char(p1, c, i);
         if (j < 0 || j + len2 > len1)
             break;
-        if (!string_cmp(p1, p2, j + 1, 1, len2 - 1))
-            return j;
+        ret = string_cmp_poll(ctx, p1, p2, j + 1, 1, len2 - 1);
+        if (ret < 0)
+            return -1;
+        if (ret == 0) {
+            *pres = j;
+            break;
+        }
     }
-    return -1;
+    return 0;
 }
 
 static int64_t string_advance_index(JSString *p, int64_t index, bool unicode)
@@ -48701,11 +48730,16 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
     }
     ret = -1;
     if (inc > 0) {
-        if (len >= v_len && start <= stop)
-            ret = string_indexof(p, p1, start);
+        if (len >= v_len && start <= stop) {
+            if (string_indexof(ctx, &ret, p, p1, start))
+                goto fail;
+        }
     } else if (len >= v_len && inc * (stop - start) >= 0) {
         for (i = start;; i += inc) {
-            if (!string_cmp(p, p1, i, 0, v_len)) {
+            int res = string_cmp_poll(ctx, p, p1, i, 0, v_len);
+            if (res < 0)
+                goto fail;
+            if (!res) {
                 ret = i;
                 break;
             }
@@ -48771,7 +48805,9 @@ static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
     }
     if (start >= 0 && start <= stop) {
         if (start < stop) {
-            ret = string_indexof(p, p1, start) >= 0;
+            if (string_indexof(ctx, &i, p, p1, start))
+                goto fail;
+            ret = i >= 0;
         } else {
             ret = !string_cmp(p, p1, start, 0, v_len);
         }
@@ -49029,6 +49065,8 @@ static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
     endOfLastMatch = 0;
     is_first = true;
     for(;;) {
+        if (js_poll_interrupts(ctx))
+            goto exception;
         if (unlikely(searchp->len == 0)) {
             if (is_first)
                 pos = 0;
@@ -49037,7 +49075,8 @@ static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
             else
                 pos = endOfLastMatch + 1;
         } else {
-            pos = string_indexof(sp, searchp, endOfLastMatch);
+            if (string_indexof(ctx, &pos, sp, searchp, endOfLastMatch))
+                goto exception;
         }
         if (pos < 0) {
             if (is_first) {
@@ -49097,6 +49136,7 @@ static JSValue js_string_split(JSContext *ctx, JSValueConst this_val,
     uint32_t lim, lengthA;
     int64_t p, q, s, r, e;
     JSString *sp, *rp;
+    int pos;
 
     if (JS_IsUndefined(O) || JS_IsNull(O))
         return JS_ThrowTypeError(ctx, "cannot convert to object");
@@ -49148,7 +49188,9 @@ static JSValue js_string_split(JSContext *ctx, JSValueConst this_val,
     }
     q = p;
     for (q = p; (q += !r) <= s - r - !r; q = p = e + r) {
-        e = string_indexof(sp, rp, q);
+        if (js_poll_interrupts(ctx) || string_indexof(ctx, &pos, sp, rp, q))
+            goto exception;
+        e = pos;
         if (e < 0)
             break;
         T = js_sub_string(ctx, sp, p, e);
